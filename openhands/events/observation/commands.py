@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Self
@@ -197,7 +198,8 @@ class CmdOutputObservation(Observation):
         ret = f'{self.metadata.prefix}{self.content}{self.metadata.suffix}'
         if self.metadata.working_dir:
             ret += f'\n[Current working directory: {self.metadata.working_dir}]'
-        if self.metadata.py_interpreter_path:
+        dataset_type = os.environ.get('SWE_BENCH_DATASET_TYPE')
+        if self.metadata.py_interpreter_path and dataset_type != 'nv-internal-1':
             ret += f'\n[Python interpreter: {self.metadata.py_interpreter_path}]'
         if self.metadata.exit_code != -1:
             ret += f'\n[Command finished with exit code {self.metadata.exit_code}]'

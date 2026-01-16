@@ -482,6 +482,7 @@ def _process_instance_wrapper(
                 msg += f'Runtime disconnected error detected for instance {instance.instance_id}, runtime failure count: {runtime_failure_count}'
                 msg += '\n' + '-' * 10 + '\n'
             logger.error(msg)
+            print(msg, flush=True)
             time.sleep(5)
 
 
@@ -641,7 +642,7 @@ def is_fatal_evaluation_error(error: str | None) -> bool:
     FATAL_EXCEPTIONS = [
         AgentRuntimeError,
         AgentRuntimeBuildError,
-        AgentRuntimeTimeoutError,
+        # AgentRuntimeTimeoutError is NOT fatal - we want the agent to see it and try a different approach
         AgentRuntimeUnavailableError,
         AgentRuntimeNotReadyError,
         AgentRuntimeDisconnectedError,
@@ -661,7 +662,7 @@ def is_fatal_runtime_error(error: str | None) -> bool:
         return False
 
     FATAL_RUNTIME_ERRORS = [
-        AgentRuntimeTimeoutError,
+        # AgentRuntimeTimeoutError is NOT fatal - we want the agent to see it and try a different approach
         AgentRuntimeUnavailableError,
         AgentRuntimeDisconnectedError,
         AgentRuntimeNotFoundError,

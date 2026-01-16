@@ -68,7 +68,7 @@ def create_cmd_run_tool(
                     },
                     'timeout': {
                         'type': 'number',
-                        'description': 'Optional. Sets a hard timeout in seconds for the command execution. If not provided, the command will use the default soft timeout behavior.',
+                        'description': 'Optional. Sets a hard timeout in seconds for the command execution. If not provided, the command will use the default soft timeout behavior. Max value is 600 seconds.',
                     },
                     'security_risk': {
                         'type': 'string',

@@ -65,7 +65,18 @@ def event_from_dict(data: dict[str, Any]) -> 'Event':
             if key == 'source':
                 value = EventSource(value)
             if key == 'tool_call_metadata':
+                # Extract provider_specific_fields if present before creating ToolCallMetadata
+                provider_specific_fields = None
+                if isinstance(value, dict) and 'model_response' in value:
+                    model_response_dict = value['model_response']
+                    if isinstance(model_response_dict, dict) and 'provider_specific_fields' in model_response_dict:
+                        provider_specific_fields = model_response_dict.pop('provider_specific_fields')
+                
                 value = ToolCallMetadata(**value)
+
+                # Add provider_specific_fields back to the model_response
+                if provider_specific_fields is not None:
+                    value.model_response._provider_specific_fields = provider_specific_fields
             if key == 'llm_metrics':
                 metrics = Metrics()
                 if isinstance(value, dict):
@@ -115,7 +126,13 @@ def event_to_dict(event: 'Event') -> dict:
         if key == 'recall_type' and 'recall_type' in d:
             d['recall_type'] = d['recall_type'].value
         if key == 'tool_call_metadata' and 'tool_call_metadata' in d:
-            d['tool_call_metadata'] = d['tool_call_metadata'].model_dump()
+            metadata_dict = d['tool_call_metadata'].model_dump()
+            # Include _provider_specific_fields if present
+            if hasattr(d['tool_call_metadata'].model_response, '_provider_specific_fields'):
+                provider_specific_fields = d['tool_call_metadata'].model_response._provider_specific_fields
+                if 'model_response' in metadata_dict and isinstance(metadata_dict['model_response'], dict):
+                    metadata_dict['model_response']['provider_specific_fields'] = provider_specific_fields
+            d['tool_call_metadata'] = metadata_dict
         if key == 'llm_metrics' and 'llm_metrics' in d:
             d['llm_metrics'] = d['llm_metrics'].get()
         props.pop(key, None)

@@ -23,6 +23,7 @@ from openhands.agenthub.codeact_agent.tools.security_utils import RISK_LEVELS
 from openhands.core.exceptions import (
     FunctionCallNotExistsError,
     FunctionCallValidationError,
+    LLMContextWindowExceedError,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
@@ -77,6 +78,16 @@ def response_to_actions(
     assert len(response.choices) == 1, 'Only one choice is supported for now'
     choice = response.choices[0]
     assistant_msg = choice.message
+
+    # Check if both content and tool_calls are None - this indicates context length has been hit
+    has_content = assistant_msg.content is not None
+    has_tool_calls = hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls
+
+    if not has_content and not has_tool_calls:
+        raise LLMContextWindowExceedError(
+            'LLM returned empty response with no content and no tool calls. This indicates the context length limit has been exceeded.'
+        )
+
     if hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls:
         # Check if there's assistant_msg.content. If so, add it to the thought
         thought = ''
@@ -111,10 +122,10 @@ def response_to_actions(
                 is_input = arguments.get('is_input', 'false') == 'true'
                 action = CmdRunAction(command=arguments['command'], is_input=is_input)
 
-                # Set hard timeout if provided
+                # Set hard timeout if provided (capped at 600 seconds max)
                 if 'timeout' in arguments:
                     try:
-                        action.set_hard_timeout(float(arguments['timeout']))
+                        action.set_hard_timeout(min(float(arguments['timeout']), 600))
                     except ValueError as e:
                         raise FunctionCallValidationError(
                             f"Invalid float passed to 'timeout' argument: {arguments['timeout']}"
@@ -320,12 +331,16 @@ def response_to_actions(
             )
             actions.append(action)
     else:
-        actions.append(
-            MessageAction(
-                content=str(assistant_msg.content) if assistant_msg.content else '',
-                wait_for_response=True,
-            )
+        message_action = MessageAction(
+            content=str(assistant_msg.content) if assistant_msg.content else '',
+            wait_for_response=True,
         )
+        # Add metadata for non-tool-call messages to preserve token IDs and logprobs
+        message_action.tool_call_metadata = ToolCallMetadata(
+            model_response=response,
+            total_calls_in_response=0,
+        )
+        actions.append(message_action)
 
     # Add response id to actions
     # This will ensure we can match both actions without tool calls (e.g. MessageAction)

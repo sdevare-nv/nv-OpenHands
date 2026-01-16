@@ -258,6 +258,11 @@ class ConversationMemory:
             llm_response: ModelResponse = tool_metadata.model_response
             assistant_msg = getattr(llm_response.choices[0], 'message')
 
+            # Extract provider_specific_fields if available
+            provider_specific_fields = getattr(
+                llm_response, '_provider_specific_fields', {}
+            )
+
             # Add the LLM message (assistant) that initiated the tool calls
             # (overwrites any previous message with the same response_id)
             pending_tool_call_action_messages[llm_response.id] = Message(
@@ -267,6 +272,13 @@ class ConversationMemory:
                 if assistant_msg.content and assistant_msg.content.strip()
                 else [],
                 tool_calls=assistant_msg.tool_calls,
+                prompt_token_ids=provider_specific_fields.get('prompt_token_ids'),
+                generation_token_ids=provider_specific_fields.get(
+                    'generation_token_ids'
+                ),
+                generation_log_probs=provider_specific_fields.get(
+                    'generation_log_probs'
+                ),
             )
             return []
         elif isinstance(action, AgentFinishAction):
@@ -314,10 +326,27 @@ class ConversationMemory:
                     content.append(ImageContent(image_urls=action.image_urls))
             if role not in ('user', 'system', 'assistant', 'tool'):
                 raise ValueError(f'Invalid role: {role}')
+
+            # Extract provider_specific_fields if available (for assistant messages)
+            provider_specific_fields = {}
+            if role == 'assistant' and action.tool_call_metadata is not None:
+                provider_specific_fields = getattr(
+                    action.tool_call_metadata.model_response,
+                    '_provider_specific_fields',
+                    {},
+                )
+
             return [
                 Message(
                     role=role,  # type: ignore[arg-type]
                     content=content,
+                    prompt_token_ids=provider_specific_fields.get('prompt_token_ids'),
+                    generation_token_ids=provider_specific_fields.get(
+                        'generation_token_ids'
+                    ),
+                    generation_log_probs=provider_specific_fields.get(
+                        'generation_log_probs'
+                    ),
                 )
             ]
         elif isinstance(action, CmdRunAction) and action.source == 'user':

@@ -22,23 +22,3 @@ fi
 WORKSPACE_NAME=$(echo "$item" | jq -r '(.repo | tostring) + "__" + (.version | tostring) | gsub("/"; "__")')
 
 echo "WORKSPACE_NAME: $WORKSPACE_NAME"
-
-mkdir -p /workspace
-
-# Remove existing workspace if present
-if [ -d /workspace/$WORKSPACE_NAME ]; then
-    rm -rf /workspace/$WORKSPACE_NAME
-fi
-
-# Use cp with hard links (-al) for near-instant copy
-# Falls back to regular copy if hard links fail (different filesystems)
-if ! cp -al /testbed /workspace/$WORKSPACE_NAME 2>/dev/null; then
-    echo "Hard link copy failed, falling back to regular copy..."
-    cp -r /testbed /workspace/$WORKSPACE_NAME
-fi
-
-# Activate instance-specific environment
-if [ -d /opt/miniconda3 ]; then
-    . /opt/miniconda3/etc/profile.d/conda.sh
-    conda activate testbed
-fi
