@@ -23,6 +23,7 @@ TOP_KEYS = [
     'observation',
     'tool_call_metadata',
     'llm_metrics',
+    'execution_latency',
 ]
 UNDERSCORE_KEYS = [
     'id',
@@ -31,6 +32,7 @@ UNDERSCORE_KEYS = [
     'cause',
     'tool_call_metadata',
     'llm_metrics',
+    'execution_latency',
 ]
 
 DELETE_FROM_TRAJECTORY_EXTRAS = {
@@ -71,7 +73,7 @@ def event_from_dict(data: dict[str, Any]) -> 'Event':
                     model_response_dict = value['model_response']
                     if isinstance(model_response_dict, dict) and 'provider_specific_fields' in model_response_dict:
                         provider_specific_fields = model_response_dict.pop('provider_specific_fields')
-                
+
                 value = ToolCallMetadata(**value)
 
                 # Add provider_specific_fields back to the model_response

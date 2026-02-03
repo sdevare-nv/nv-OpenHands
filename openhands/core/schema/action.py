@@ -100,3 +100,6 @@ class ActionType(str, Enum):
 
     LOOP_RECOVERY = 'loop_recovery'
     """Recover dead loop."""
+
+    VALIDATION_FAILURE = 'validation_failure'
+    """Represents a validation failure for a function call."""

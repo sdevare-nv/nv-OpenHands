@@ -7,6 +7,7 @@ from typing import Any, Callable, cast
 
 import httpx
 import uuid
+import tempfile
 
 
 from openhands.core.config import LLMConfig
@@ -360,7 +361,7 @@ class LLM(RetryMixin, DebugMixin):
                 kwargs.pop('extra_body', None)
 
             # Record start time for latency measurement
-            start_time = time.time()
+            start_time = time.perf_counter()
             # we don't support streaming here, thus we get a ModelResponse
 
             # Suppress httpx deprecation warnings during LiteLLM calls
@@ -386,7 +387,7 @@ class LLM(RetryMixin, DebugMixin):
                     self.response_headers = resp._response_headers
 
             # Calculate and record latency
-            latency = time.time() - start_time
+            latency = time.perf_counter() - start_time
             response_id = resp.get('id', 'unknown')
             self.metrics.add_response_latency(latency, response_id)
 
@@ -467,8 +468,10 @@ class LLM(RetryMixin, DebugMixin):
                     # Save fncall_messages/response separately
                     _d['fncall_messages'] = original_fncall_messages
                     _d['fncall_response'] = resp
-                with open(log_file, 'w') as f:
+                temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(log_file))
+                with os.fdopen(temp_fd, 'w') as f:
                     f.write(json.dumps(_d))
+                os.replace(temp_path, log_file)
 
             return resp
 
