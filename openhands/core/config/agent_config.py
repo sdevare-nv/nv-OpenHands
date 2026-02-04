@@ -21,6 +21,12 @@ class AgentConfig(BaseModel):
     """The classpath of the agent to use. To be used for custom agents that are not defined in the openhands.agenthub package."""
     system_prompt_filename: str = Field(default='system_prompt.j2')
     """Filename of the system prompt template file within the agent's prompt directory. Defaults to 'system_prompt.j2'."""
+    custom_prompt_dir: str | None = Field(default=None)
+    """Optional custom directory containing prompt templates. If set, overrides the agent's default prompt directory."""
+    system_prompt_path: str | None = Field(default=None)
+    """Optional absolute path to a custom system_prompt.j2 file. Takes precedence over custom_prompt_dir."""
+    system_prompt_long_horizon_path: str | None = Field(default=None)
+    """Optional absolute path to a custom system_prompt_long_horizon.j2 file. Takes precedence over custom_prompt_dir."""
     enable_browsing: bool = Field(default=True)
     """Whether to enable browsing tool.
     Note: If using CLIRuntime, browsing is not implemented and should be disabled."""

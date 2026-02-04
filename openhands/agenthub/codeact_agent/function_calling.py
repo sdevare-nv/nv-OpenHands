@@ -13,12 +13,17 @@ from litellm import (
 from openhands.agenthub.codeact_agent.tools import (
     BrowserTool,
     CondensationRequestTool,
+    EditTool,
     FinishTool,
+    GlobTool,
+    GrepTool,
     IPythonTool,
+    ListDirTool,
     LLMBasedFileEditTool,
+    ReadTool,
     ThinkTool,
+    WriteTool,
     create_cmd_run_tool,
-    create_str_replace_editor_tool,
 )
 from openhands.agenthub.codeact_agent.tools.security_utils import RISK_LEVELS
 from openhands.core.exceptions import (
@@ -37,8 +42,14 @@ from openhands.events.action import (
     CmdRunAction,
     FileEditAction,
     FileReadAction,
+    FileWriteAction,
+    GlobAction,
+    GrepAction,
     IPythonRunCellAction,
+    ListDirAction,
     MessageAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
     TaskTrackingAction,
     ValidationFailureAction,
 )
@@ -46,14 +57,22 @@ from openhands.events.action.agent import CondensationRequestAction
 from openhands.events.action.mcp import MCPAction
 from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.tool import ToolCallMetadata
-from openhands.llm.tool_names import TASK_TRACKER_TOOL_NAME
+from openhands.llm.tool_names import (
+    EDIT_TOOL_NAME,
+    GLOB_TOOL_NAME,
+    GREP_TOOL_NAME,
+    LIST_DIR_TOOL_NAME,
+    READ_TOOL_NAME,
+    TASK_TRACKER_TOOL_NAME,
+    WRITE_TOOL_NAME,
+)
 
 
 def combine_thought(action: Action, thought: str) -> Action:
-    if not hasattr(action, 'thought'):
+    if not hasattr(action, "thought"):
         return action
     if thought and action.thought:
-        action.thought = f'{thought}\n{action.thought}'
+        action.thought = f"{thought}\n{action.thought}"
     elif thought:
         action.thought = thought
     return action
@@ -63,42 +82,42 @@ def set_security_risk(action: Action, arguments: dict) -> None:
     """Set the security risk level for the action."""
 
     # Set security_risk attribute if provided
-    if 'security_risk' in arguments:
-        if arguments['security_risk'] in RISK_LEVELS:
-            if hasattr(action, 'security_risk'):
+    if "security_risk" in arguments:
+        if arguments["security_risk"] in RISK_LEVELS:
+            if hasattr(action, "security_risk"):
                 action.security_risk = getattr(
-                    ActionSecurityRisk, arguments['security_risk']
+                    ActionSecurityRisk, arguments["security_risk"]
                 )
         else:
-            logger.warning(f'Invalid security_risk value: {arguments["security_risk"]}')
+            logger.warning(f"Invalid security_risk value: {arguments['security_risk']}")
 
 
 def response_to_actions(
     response: ModelResponse, mcp_tool_names: list[str] | None = None
 ) -> list[Action]:
     actions: list[Action] = []
-    assert len(response.choices) == 1, 'Only one choice is supported for now'
+    assert len(response.choices) == 1, "Only one choice is supported for now"
     choice = response.choices[0]
     assistant_msg = choice.message
 
     # Check if both content and tool_calls are None - this indicates context length has been hit
     has_content = assistant_msg.content is not None
-    has_tool_calls = hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls
+    has_tool_calls = hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls
 
     if not has_content and not has_tool_calls:
         raise LLMContextWindowExceedError(
-            'LLM returned empty response with no content and no tool calls. This indicates the context length limit has been exceeded.'
+            "LLM returned empty response with no content and no tool calls. This indicates the context length limit has been exceeded."
         )
 
-    if hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls:
+    if hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls:
         # Check if there's assistant_msg.content. If so, add it to the thought
-        thought = ''
+        thought = ""
         if isinstance(assistant_msg.content, str):
             thought = assistant_msg.content
         elif isinstance(assistant_msg.content, list):
             for msg in assistant_msg.content:
-                if msg['type'] == 'text':
-                    thought += msg['text']
+                if msg["type"] == "text":
+                    thought += msg["text"]
 
         # Process each tool call to OpenHands action
         for i, tool_call in enumerate(assistant_msg.tool_calls):
@@ -310,6 +329,97 @@ def response_to_actions(
                         command=arguments['command'],
                         task_list=normalized_task_list,
                     )
+                    
+                # ================================================
+                # ReadTool (OpenCode-style file reading)
+                # ================================================
+                elif tool_call.function.name == ReadTool["function"]["name"]:
+                    if "file_path" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "file_path" in tool call {tool_call.function.name}'
+                        )
+                    action = OpenCodeReadAction(
+                        path=arguments["file_path"],
+                        offset=arguments.get("offset", 0),
+                        limit=arguments.get("limit", 2000),
+                    )
+
+                # ================================================
+                # WriteTool (OpenCode-style file writing with LSP diagnostics)
+                # ================================================
+                elif tool_call.function.name == WriteTool["function"]["name"]:
+                    if "file_path" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "file_path" in tool call {tool_call.function.name}'
+                        )
+                    if "content" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "content" in tool call {tool_call.function.name}'
+                        )
+                    action = OpenCodeWriteAction(
+                        path=arguments["file_path"],
+                        content=arguments["content"],
+                    )
+
+                # ================================================
+                # EditTool (OpenCode-style string replacement)
+                # ================================================
+                elif tool_call.function.name == EditTool["function"]["name"]:
+                    if "file_path" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "file_path" in tool call {tool_call.function.name}'
+                        )
+                    if "old_string" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "old_string" in tool call {tool_call.function.name}'
+                        )
+                    if "new_string" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "new_string" in tool call {tool_call.function.name}'
+                        )
+                    action = FileEditAction(
+                        path=arguments["file_path"],
+                        command="str_replace",
+                        old_str=arguments["old_string"],
+                        new_str=arguments["new_string"],
+                        impl_source=FileEditSource.OH_ACI,
+                    )
+
+                # ================================================
+                # GlobTool (File pattern search, respects gitignore, sorted by mtime)
+                # ================================================
+                elif tool_call.function.name == GlobTool["function"]["name"]:
+                    if "pattern" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "pattern" in tool call {tool_call.function.name}'
+                        )
+                    action = GlobAction(
+                        pattern=arguments["pattern"],
+                        path=arguments.get("path", "."),
+                    )
+
+                # ================================================
+                # GrepTool (Content search, respects gitignore)
+                # ================================================
+                elif tool_call.function.name == GrepTool["function"]["name"]:
+                    if "pattern" not in arguments:
+                        raise FunctionCallValidationError(
+                            f'Missing required argument "pattern" in tool call {tool_call.function.name}'
+                        )
+                    action = GrepAction(
+                        pattern=arguments["pattern"],
+                        path=arguments.get("path", "."),
+                        include=arguments.get("include", ""),
+                    )
+
+                # ================================================
+                # ListDirTool (Directory listing with tree structure, respects gitignore)
+                # ================================================
+                elif tool_call.function.name == ListDirTool["function"]["name"]:
+                    action = ListDirAction(
+                        path=arguments.get("path", "."),
+                        ignore=arguments.get("ignore", []),
+                    )
 
                 # ================================================
                 # MCPAction (MCP)
@@ -345,7 +455,7 @@ def response_to_actions(
             actions.append(action)
     else:
         message_action = MessageAction(
-            content=str(assistant_msg.content) if assistant_msg.content else '',
+            content=str(assistant_msg.content) if assistant_msg.content else "",
             wait_for_response=True,
         )
         # Add metadata for non-tool-call messages to preserve token IDs and logprobs

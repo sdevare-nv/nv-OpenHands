@@ -64,3 +64,20 @@ class ObservationType(str, Enum):
 
     VALIDATION_FAILURE = 'validation_failure'
     """Result of a validation failure for a function call"""
+
+    # OpenCode-style observations
+    GLOB = 'glob'
+    """Result of a glob file search operation."""
+
+    GREP = 'grep'
+    """Result of a grep content search operation."""
+
+    LIST_DIR = 'list_dir'
+    """Result of a directory listing operation."""
+
+    OPENCODE_READ = 'opencode_read'
+    """Result of an OpenCode-style file read operation."""
+
+    OPENCODE_WRITE = 'opencode_write'
+    """Result of an OpenCode-style file write operation with diagnostics."""
+

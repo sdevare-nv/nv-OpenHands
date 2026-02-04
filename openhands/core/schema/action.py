@@ -103,3 +103,20 @@ class ActionType(str, Enum):
 
     VALIDATION_FAILURE = 'validation_failure'
     """Represents a validation failure for a function call."""
+
+    # OpenCode-style actions
+    GLOB = 'glob'
+    """Searches for files matching a glob pattern."""
+
+    GREP = 'grep'
+    """Searches file contents using a regex pattern."""
+
+    LIST_DIR = 'list_dir'
+    """Lists files and directories in a given path."""
+
+    OPENCODE_READ = 'opencode_read'
+    """Reads a file with OpenCode-style formatting (5-digit line numbers, binary detection, etc.)."""
+
+    OPENCODE_WRITE = 'opencode_write'
+    """Writes a file with LSP diagnostics after write."""
+

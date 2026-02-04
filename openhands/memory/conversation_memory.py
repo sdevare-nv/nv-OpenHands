@@ -21,6 +21,13 @@ from openhands.events.action import (
     TaskTrackingAction,
 )
 from openhands.events.action.mcp import MCPAction
+from openhands.events.action.opencode import (
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+)
 from openhands.events.action.message import SystemMessageAction
 from openhands.events.event import Event, RecallType
 from openhands.events.observation import (
@@ -32,6 +39,7 @@ from openhands.events.observation import (
     FileDownloadObservation,
     FileEditObservation,
     FileReadObservation,
+    FileWriteObservation,
     IPythonRunCellObservation,
     LoopDetectionObservation,
     TaskTrackingObservation,
@@ -232,6 +240,12 @@ class ConversationMemory:
                 BrowseURLAction,
                 MCPAction,
                 TaskTrackingAction,
+                # OpenCode-style actions
+                GlobAction,
+                GrepAction,
+                ListDirAction,
+                OpenCodeReadAction,
+                OpenCodeWriteAction,
             ),
         ) or (isinstance(action, CmdRunAction) and action.source == 'agent'):
             tool_metadata = action.tool_call_metadata
@@ -481,6 +495,12 @@ class ConversationMemory:
             message = Message(
                 role='user', content=[TextContent(text=obs.content)]
             )  # Content is already truncated by openhands-aci
+        elif isinstance(obs, FileWriteObservation):
+            text = truncate_content(
+                f'File written successfully: {obs.path}\n{obs.content}',
+                max_message_chars,
+            )
+            message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, BrowserOutputObservation):
             text = obs.content
             content = [TextContent(text=text)]

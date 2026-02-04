@@ -31,6 +31,13 @@ from openhands.events.action import (
     IPythonRunCellAction,
     ValidationFailureAction,
 )
+from openhands.events.action.opencode import (
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+)
 from openhands.events.action.action import Action
 from openhands.events.action.files import FileEditSource
 from openhands.events.action.mcp import MCPAction
@@ -368,6 +375,25 @@ class ActionExecutionClient(Runtime):
         return self.send_action_for_execution(action)
 
     def browse_interactive(self, action: BrowseInteractiveAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    # =========================================================================
+    # OpenCode-style action handlers
+    # =========================================================================
+
+    def glob(self, action: GlobAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def grep(self, action: GrepAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def list_dir(self, action: ListDirAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def opencode_read(self, action: OpenCodeReadAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def opencode_write(self, action: OpenCodeWriteAction) -> Observation:
         return self.send_action_for_execution(action)
 
     def get_mcp_config(

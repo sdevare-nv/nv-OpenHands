@@ -24,7 +24,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
-from openhands_aci.editor.editor import OHEditor
+# Use OpenCodeEditor with fuzzy matching instead of default OHEditor
+try:
+    from openhands.agenthub.codeact_agent.tools.opencode_editor import OpenCodeEditor as OHEditor
+except ImportError:
+    # Fallback to standard OHEditor if OpenCodeEditor not available (e.g., in sandbox)
+    from openhands_aci.editor.editor import OHEditor
 from openhands_aci.editor.exceptions import ToolError
 from openhands_aci.editor.results import ToolResult
 from openhands_aci.utils.diff import get_diff
@@ -45,7 +50,12 @@ from openhands.events.action import (
     FileEditAction,
     FileReadAction,
     FileWriteAction,
+    GlobAction,
+    GrepAction,
     IPythonRunCellAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
 )
 from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
@@ -586,6 +596,451 @@ class ActionExecutor:
                 new_contents=new_content or '',
                 filepath=action.path,
             ),
+        )
+
+    # =========================================================================
+    # OpenCode-style action handlers
+    # =========================================================================
+
+    async def opencode_read(self, action: OpenCodeReadAction) -> Observation:
+        """Execute OpenCode-style file read with 5-digit line numbers."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.path, working_dir)
+
+        # Constants matching OpenCode behavior
+        MAX_BYTES = 50 * 1024  # 50KB
+        MAX_LINE_LENGTH = 2000
+        BINARY_EXTENSIONS = {
+            '.zip', '.tar', '.gz', '.exe', '.dll', '.so', '.class', '.jar',
+            '.war', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            '.bin', '.dat', '.obj', '.o', '.a', '.lib', '.wasm', '.pyc', '.pyo'
+        }
+
+        # Check if file exists
+        if not os.path.exists(filepath):
+            # Try to find suggestions
+            directory = os.path.dirname(filepath) or '.'
+            basename = os.path.basename(filepath)
+
+            if os.path.isdir(directory):
+                try:
+                    entries = os.listdir(directory)
+                    suggestions = [
+                        os.path.join(directory, entry)
+                        for entry in entries
+                        if basename.lower() in entry.lower() or entry.lower() in basename.lower()
+                    ][:3]
+
+                    if suggestions:
+                        return ErrorObservation(
+                            f"File not found: {filepath}\n\nDid you mean one of these?\n"
+                            + "\n".join(suggestions)
+                        )
+                except OSError:
+                    pass
+
+            return ErrorObservation(f"File not found: {filepath}")
+
+        # Check if directory
+        if os.path.isdir(filepath):
+            return ErrorObservation(f"Path is a directory: {filepath}. You can only read files")
+
+        # Check binary by extension
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in BINARY_EXTENSIONS:
+            return ErrorObservation(f"Cannot read binary file: {filepath}")
+
+        # Check binary by content
+        try:
+            with open(filepath, 'rb') as f:
+                chunk = f.read(4096)
+                if b'\x00' in chunk:
+                    return ErrorObservation(f"Cannot read binary file: {filepath}")
+                if chunk:
+                    non_printable = sum(1 for b in chunk if b < 9 or (b > 13 and b < 32))
+                    if non_printable / len(chunk) > 0.3:
+                        return ErrorObservation(f"Cannot read binary file: {filepath}")
+        except Exception:
+            pass
+
+        # Read file
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.read().split('\n')
+        except Exception as e:
+            return ErrorObservation(f"Error reading file: {e}")
+
+        # Process lines with offset and limit
+        offset = action.offset
+        limit = action.limit
+        raw = []
+        total_bytes = 0
+        truncated_by_bytes = False
+
+        for i in range(offset, min(len(lines), offset + limit)):
+            line = lines[i]
+            if len(line) > MAX_LINE_LENGTH:
+                line = line[:MAX_LINE_LENGTH] + "..."
+
+            line_bytes = len(line.encode('utf-8')) + (1 if raw else 0)
+            if total_bytes + line_bytes > MAX_BYTES:
+                truncated_by_bytes = True
+                break
+
+            raw.append(line)
+            total_bytes += line_bytes
+
+        # Format with 5-digit line numbers and | separator (OpenCode style)
+        content_lines = [
+            f"{str(i + offset + 1).zfill(5)}| {line}"
+            for i, line in enumerate(raw)
+        ]
+
+        total_lines = len(lines)
+        last_read_line = offset + len(raw)
+        has_more_lines = total_lines > last_read_line
+        truncated = has_more_lines or truncated_by_bytes
+
+        output = "<file>\n"
+        output += "\n".join(content_lines)
+
+        if truncated_by_bytes:
+            output += f"\n\n(Output truncated at {MAX_BYTES} bytes. Use 'offset' parameter to read beyond line {last_read_line})"
+        elif has_more_lines:
+            output += f"\n\n(File has more lines. Use 'offset' parameter to read beyond line {last_read_line})"
+        else:
+            output += f"\n\n(End of file - total {total_lines} lines)"
+
+        output += "\n</file>"
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"opencode_read {filepath}",
+        )
+
+    async def opencode_write(self, action: OpenCodeWriteAction) -> Observation:
+        """Execute OpenCode-style file write with LSP diagnostics."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.path, working_dir)
+
+        # Create directory if needed
+        directory = os.path.dirname(filepath)
+        if directory and not os.path.exists(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError as e:
+                return ErrorObservation(f"Failed to create directory: {e}")
+
+        # Write file
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(action.content)
+        except Exception as e:
+            return ErrorObservation(f"Failed to write file: {e}")
+
+        output = "Wrote file successfully."
+
+        # Run linter based on file extension
+        ext = os.path.splitext(filepath)[1].lower()
+        errors = []
+
+        try:
+            import subprocess
+
+            if ext == '.py':
+                # Try flake8, pylint, py_compile in order
+                for linter_cmd in [
+                    ['flake8', '--max-line-length=120', filepath],
+                    ['pylint', '--errors-only', filepath],
+                    ['python3', '-m', 'py_compile', filepath],
+                ]:
+                    try:
+                        result = subprocess.run(
+                            linter_cmd, capture_output=True, text=True, timeout=10
+                        )
+                        lint_output = result.stdout.strip() or result.stderr.strip()
+                        if lint_output:
+                            errors.extend(lint_output.split('\n')[:20])
+                            break
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+
+            elif ext in ('.js', '.jsx', '.ts', '.tsx'):
+                try:
+                    result = subprocess.run(
+                        ['eslint', '--format=compact', filepath],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result.stdout.strip():
+                        errors.extend(result.stdout.strip().split('\n')[:20])
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+            elif ext == '.go':
+                try:
+                    result = subprocess.run(
+                        ['go', 'vet', filepath],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result.stderr.strip():
+                        errors.extend(result.stderr.strip().split('\n')[:20])
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+            elif ext == '.rs':
+                try:
+                    result = subprocess.run(
+                        ['cargo', 'check', '--message-format=short'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.stderr.strip():
+                        error_lines = [
+                            l for l in result.stderr.strip().split('\n')
+                            if 'error' in l.lower()
+                        ][:20]
+                        errors.extend(error_lines)
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+        except Exception:
+            pass
+
+        if errors:
+            output += f'\n\nLSP errors detected in this file, please fix:\n'
+            output += f'<diagnostics file="{filepath}">\n'
+            output += '\n'.join(errors)
+            output += '\n</diagnostics>'
+
+        return FileWriteObservation(content=output, path=filepath)
+
+    async def glob(self, action: GlobAction) -> Observation:
+        """Execute glob file search using ripgrep or find."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        search_path = self._resolve_path(action.path, working_dir)
+
+        import subprocess
+
+        files = []
+        truncated = False
+        limit = 100
+
+        # Try ripgrep first (respects .gitignore, sorts by mtime)
+        try:
+            result = subprocess.run(
+                ['rg', '--files', '-g', action.pattern, '--sortr', 'modified', search_path],
+                capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                all_files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+                if len(all_files) > limit:
+                    truncated = True
+                files = all_files[:limit]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Fallback to find with mtime sorting
+        if not files:
+            try:
+                result = subprocess.run(
+                    ['find', search_path, '-type', 'f', '-name', action.pattern,
+                     '-printf', '%T@ %p\n'],
+                    capture_output=True, text=True, timeout=30, cwd=working_dir
+                )
+                if result.stdout.strip():
+                    lines = result.stdout.strip().split('\n')
+                    # Sort by mtime (first field) descending
+                    sorted_lines = sorted(lines, key=lambda x: float(x.split()[0]) if x else 0, reverse=True)
+                    all_files = [' '.join(l.split()[1:]) for l in sorted_lines if l]
+                    if len(all_files) > limit:
+                        truncated = True
+                    files = all_files[:limit]
+            except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+                pass
+
+        # Build output
+        if not files:
+            output = "No files found"
+        else:
+            output = '\n'.join(files)
+            if truncated:
+                output += '\n\n(Results are truncated. Consider using a more specific path or pattern.)'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"glob {action.pattern} {action.path}",
+        )
+
+    async def grep(self, action: GrepAction) -> Observation:
+        """Execute grep content search using ripgrep or grep."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        search_path = self._resolve_path(action.path, working_dir)
+
+        import subprocess
+
+        output = ""
+        limit = 100
+
+        # Try ripgrep first (respects .gitignore)
+        try:
+            cmd = ['rg', '-n', action.pattern, search_path]
+            if action.include:
+                cmd = ['rg', '-n', '-g', action.include, action.pattern, search_path]
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            if result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                if len(lines) > limit:
+                    output = '\n'.join(lines[:limit])
+                    output += f'\n\n(Results truncated, showing {limit} of {len(lines)}+ matches)'
+                else:
+                    output = '\n'.join(lines)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Fallback to grep
+        if not output:
+            try:
+                if action.include:
+                    # Use find + grep for file filtering
+                    result = subprocess.run(
+                        f'find {search_path} -type f -name "{action.include}" '
+                        f'-exec grep -Hn "{action.pattern}" {{}} \\; 2>/dev/null | head -{limit}',
+                        shell=True, capture_output=True, text=True, timeout=30, cwd=working_dir
+                    )
+                else:
+                    result = subprocess.run(
+                        f'grep -rn "{action.pattern}" {search_path} 2>/dev/null | head -{limit}',
+                        shell=True, capture_output=True, text=True, timeout=30, cwd=working_dir
+                    )
+                output = result.stdout.strip() or "No matches found"
+            except (subprocess.TimeoutExpired, Exception):
+                output = "No matches found"
+
+        if not output:
+            output = "No matches found"
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"grep {action.pattern} {action.path}",
+        )
+
+    async def list_dir(self, action: ListDirAction) -> Observation:
+        """Execute directory listing with tree structure."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        list_path = self._resolve_path(action.path, working_dir)
+
+        import subprocess
+
+        # Combine default and custom ignore patterns
+        all_ignores = action.all_ignores
+
+        files = []
+        limit = 100
+
+        # Try ripgrep first (respects .gitignore)
+        try:
+            cmd = ['rg', '--files']
+            for pattern in all_ignores:
+                cmd.extend(['-g', f'!{pattern}/**'])
+            if list_path != '.':
+                cmd.append(list_path)
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()][:limit]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Build tree structure if we have files
+        if files:
+            dirs = set()
+            files_by_dir = {}
+
+            for f in files:
+                d = os.path.dirname(f) or '.'
+                parts = d.split(os.sep) if d != '.' else []
+
+                # Add all parent directories
+                for i in range(len(parts) + 1):
+                    dir_p = os.sep.join(parts[:i]) if i > 0 else '.'
+                    dirs.add(dir_p)
+
+                # Add file to its directory
+                if d not in files_by_dir:
+                    files_by_dir[d] = []
+                files_by_dir[d].append(os.path.basename(f))
+
+            def render_dir(dir_path: str, depth: int) -> str:
+                output = ''
+                if depth > 0:
+                    output += '  ' * depth + os.path.basename(dir_path) + '/\n'
+
+                # Get child directories
+                children = sorted([
+                    d for d in dirs
+                    if os.path.dirname(d) == dir_path and d != dir_path
+                ])
+
+                # Render subdirectories first
+                for child in children:
+                    output += render_dir(child, depth + 1)
+
+                # Render files
+                for f in sorted(files_by_dir.get(dir_path, [])):
+                    output += '  ' * (depth + 1) + f + '\n'
+
+                return output
+
+            abs_path = os.path.abspath(list_path)
+            output = f"{abs_path}/\n" + render_dir('.', 0)
+        else:
+            # Fallback to tree or find
+            try:
+                # Try tree command
+                ignore_args = []
+                for p in all_ignores:
+                    ignore_args.extend(['-I', p])
+
+                result = subprocess.run(
+                    ['tree', '-L', '3', '--noreport'] + ignore_args + [list_path],
+                    capture_output=True, text=True, timeout=10, cwd=working_dir
+                )
+                output = result.stdout.strip()
+            except FileNotFoundError:
+                # Fallback to find
+                try:
+                    result = subprocess.run(
+                        ['find', list_path, '-maxdepth', '3', '-type', 'f'],
+                        capture_output=True, text=True, timeout=10, cwd=working_dir
+                    )
+                    lines = result.stdout.strip().split('\n')
+                    # Filter out ignored patterns
+                    filtered = [
+                        l for l in lines
+                        if l and not any(p in l for p in all_ignores)
+                    ][:limit]
+                    output = '\n'.join(filtered) if filtered else 'No files found'
+                except Exception:
+                    output = 'No files found'
+            except subprocess.TimeoutExpired:
+                output = 'Directory listing timed out'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"list_dir {action.path}",
         )
 
     async def browse(self, action: BrowseURLAction) -> Observation:
