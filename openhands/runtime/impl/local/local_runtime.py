@@ -683,6 +683,11 @@ def _create_server(
     # Prepend the interpreter's bin directory to PATH for subprocesses
     env['PATH'] = f'{_python_bin_path()}{os.pathsep}{env.get("PATH", "")}'
 
+    # NG Openhands should log propagation
+    ng_openhands_should_log = os.environ.get("NG_OPENHANDS_SHOULD_LOG", "").lower() == "true"
+    if ng_openhands_should_log:
+        env['NG_OPENHANDS_SHOULD_LOG'] = os.environ["NG_OPENHANDS_SHOULD_LOG"]
+
     logger.debug(f'Updated PATH for subprocesses: {env["PATH"]}')
 
     server_process = subprocess.Popen(  # noqa: S603
@@ -696,6 +701,7 @@ def _create_server(
     )
 
     log_thread_exit_event = threading.Event()
+
 
     # Start a thread to read and log server output
     def log_output() -> None:
@@ -712,7 +718,9 @@ def _create_server(
                 line = server_process.stdout.readline()
                 if not line:
                     break
-                logger.info(f'server: {line.strip()}')
+
+                if ng_openhands_should_log:
+                    logger.info(f'server: {line.strip()}')
 
             # Capture any remaining output
             if not log_thread_exit_event.is_set():
@@ -720,7 +728,8 @@ def _create_server(
                 for line in server_process.stdout:
                     if log_thread_exit_event.is_set():
                         break
-                    logger.info(f'server (remaining): {line.strip()}')
+                    if ng_openhands_should_log:
+                        logger.info(f'server (remaining): {line.strip()}')
 
         except Exception as e:
             logger.error(f'Error reading server output: {e}')

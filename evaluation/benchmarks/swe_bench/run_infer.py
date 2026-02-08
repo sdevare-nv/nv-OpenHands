@@ -3,7 +3,7 @@ import copy
 import json
 import os
 import tempfile
-from typing import Any, Literal, Optional
+from typing import Any, Dict, Literal, Optional
 import time
 import pandas as pd
 import toml
@@ -77,6 +77,85 @@ BenchMode = Literal['swe', 'swt', 'swt-ci']
 DATASET_TYPE = 'SWE-bench'
 
 MAX_RETRIES = 3
+
+########################################
+# START Custom profiling code
+########################################
+
+from io import StringIO
+from pathlib import Path
+from typing import Optional
+
+import yappi
+
+
+class Profiler:
+    def __init__(self, name: str, base_profile_dir: Path) -> None:
+        self.name = name
+        self.base_profile_dir = base_profile_dir
+
+        self.required_str = None
+
+    def start(self) -> None:
+        yappi.set_clock_type("CPU")
+        yappi.start()
+        print(f"🔍 Enabled profiling for {self.name}")
+
+    def stop(self) -> None:
+        print(f"🛑 Stopping profiler for {self.name}. Check {self.base_profile_dir} for the metrics!")
+        yappi.stop()
+        self.dump()
+
+    def dump(self) -> None:
+        self.base_profile_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.base_profile_dir / f"{self.name}.log"
+        callgrind_path = self.base_profile_dir / f"{self.name}.callgrind"
+
+        yappi.get_func_stats().save(callgrind_path, type="CALLGRIND")
+
+        buffer = StringIO()
+        yappi.get_func_stats().print_all(
+            out=buffer,
+            columns={
+                0: ("name", 200),
+                1: ("ncall", 10),
+                2: ("tsub", 8),
+                3: ("ttot", 8),
+                4: ("tavg", 8),
+            },
+        )
+
+        buffer.seek(0)
+        res = ""
+        past_header = False
+        for line in buffer:
+            if not past_header or (self.required_str and self.required_str in line):
+                res += line
+
+            if line.startswith("name"):
+                past_header = True
+
+        with open(log_path, "w") as f:
+            f.write(res)
+
+
+def update_metrics(update_dict: Dict[str, Any]) -> None:
+    import os, json
+
+    metrics_fpath = os.environ["NEMO_GYM_METRICS_FPATH"]
+    with open(metrics_fpath) as f:
+        existing_dict = json.loads(f.read())
+
+    existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
+    update_dict = {k: v for k, v in update_dict.items() if v is not None}
+
+    with open(metrics_fpath, "w") as f:
+        json.dump(existing_dict | update_dict, f)
+
+
+########################################
+# END Custom profiling code
+########################################
 
 
 def set_dataset_type(dataset_name: str) -> str:
@@ -733,16 +812,19 @@ def process_instance(
     start_time = time.perf_counter()
     runtime = create_runtime(config)
     end_time = time.perf_counter()
+    update_metrics({"create_runtime_time": end_time - start_time})
     print(f"create runtime: {end_time - start_time} seconds", flush = True)
     start_time = time.perf_counter()
     call_async_from_sync(runtime.connect)
     end_time = time.perf_counter()
+    update_metrics({"connect_to_runtime_time": end_time - start_time})
     print(f"connect to runtime: {end_time - start_time} seconds", flush = True)
 
     try:
         start_time = time.perf_counter()
         initialize_runtime(runtime, instance, metadata)
         end_time = time.perf_counter()
+        update_metrics({"initialize_runtime_time": end_time - start_time})
         print(f"init runtime: {end_time - start_time} seconds", flush = True)
         message_action = get_instruction(instance, metadata)
 
@@ -901,6 +983,14 @@ if __name__ == '__main__':
     )
 
     args, _ = parser.parse_known_args()
+
+    maybe_base_profile_dir = os.environ.get("NG_PROFILING_DIR")
+    should_profile = maybe_base_profile_dir is not None
+    if should_profile:
+        profiler = Profiler(
+            name="openhands", base_profile_dir=Path(maybe_base_profile_dir)
+        )
+        profiler.start()
 
     # Validate nv-internal-1 requires instance_dict_path
     if 'nv-internal-1' in args.dataset.lower():
@@ -1161,3 +1251,6 @@ if __name__ == '__main__':
         )
         # Check if any instances reached maximum retries
         check_maximum_retries_exceeded(metadata.eval_output_dir)
+
+    if should_profile:
+        profiler.stop()

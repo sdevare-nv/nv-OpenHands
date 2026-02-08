@@ -125,6 +125,9 @@ pg8000 = "^1.31.5"
 asyncpg = "^0.30.0"
 lmnr = "^0.7.20"
 
+# NeMo Gym
+nemo-gym = { git = "https://github.com/NVIDIA-NeMo/Gym.git", rev = "main" }
+
 [tool.poetry.extras]
 third_party_runtimes = [ "e2b-code-interpreter", "modal", "runloop-api-client", "daytona" ]
 

@@ -1,7 +1,10 @@
 import os
 import sys
+import time
+import json
+import tempfile
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from openhands.llm.llm_registry import LLMRegistry
 
@@ -9,8 +12,8 @@ if TYPE_CHECKING:
     from litellm import ChatCompletionToolParam
 
     from openhands.events.action import Action
-    from openhands.llm.llm import ModelResponse
 
+from openhands.llm.llm import ModelResponse
 import openhands.agenthub.codeact_agent.function_calling as codeact_function_calling
 from openhands.agenthub.codeact_agent.tools.bash import create_cmd_run_tool
 from openhands.agenthub.codeact_agent.tools.browser import BrowserTool
@@ -90,6 +93,14 @@ class CodeActAgent(Agent):
         # Override with router if needed
         self.llm = self.llm_registry.get_router(self.config)
 
+        from nemo_gym.server_utils import ServerClient
+        from nemo_gym.global_config import get_global_config_dict
+        self.ng_server_client = ServerClient(
+            head_server_config=ServerClient.load_head_server_config(),
+            global_config_dict=get_global_config_dict(),
+        )
+        self.model_server_cookies = None
+
     @property
     def prompt_manager(self) -> PromptManager:
         if self._prompt_manager is None:
@@ -153,7 +164,7 @@ class CodeActAgent(Agent):
         # Only clear pending actions, not LLM metrics
         self.pending_actions.clear()
 
-    def step(self, state: State) -> 'Action':
+    async def step(self, state: State) -> 'Action':
         """Performs one step using the CodeAct Agent.
 
         This includes gathering info on previous steps and prompting the model to make a command to execute.
@@ -211,13 +222,109 @@ class CodeActAgent(Agent):
                 model_name=self.llm.config.model, agent_name=self.name
             )
         }
-        response = self.llm.completion(**params)
-        logger.debug(f'Response from LLM: {response}')
+
+        # Original code:
+        # response = self.llm.completion(**params)
+
+        start_time = time.time()
+        response = await self._nemo_gym_model_call(messages, params['tools'])
+        self.update_model_call_time(start_time)
+
+        ng_openhands_should_log = os.environ.get("NG_OPENHANDS_SHOULD_LOG", "").lower() == "true"
+        if ng_openhands_should_log:
+            logger.debug(f'Response from LLM: {response}')
+
         actions = self.response_to_actions(response)
-        logger.debug(f'Actions after response_to_actions: {actions}')
+
+        if ng_openhands_should_log:
+            logger.debug(f'Actions after response_to_actions: {actions}')
+
         for action in actions:
             self.pending_actions.append(action)
         return self.pending_actions.popleft()
+
+    def update_model_call_time(self, start_time: float) -> None:
+        import os, json
+
+        metrics_fpath = os.environ["NEMO_GYM_METRICS_FPATH"]
+        with open(metrics_fpath) as f:
+            existing_dict = json.loads(f.read())
+
+        model_call_time_taken = existing_dict.get("total_model_call_time", 0.0)
+        existing_dict["total_model_call_time"] = model_call_time_taken + time.time() - start_time
+
+        with open(metrics_fpath, "w") as f:
+            json.dump(existing_dict, f)
+
+    async def _nemo_gym_model_call(self, messages: list[Message], tools: list['ChatCompletionToolParam']) -> ModelResponse:
+        message_dicts = [m.model_dump() for m in messages]
+        params ={
+            "messages": message_dicts,
+            "tools": tools,
+            **self.llm._nemo_gym_llm_kwargs,
+        }
+
+        # Remove prompt_token_ids, generation_token_ids, and generation_log_probs from all messages except the last
+        fields_to_remove = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
+        last_occurrence_idx_seen = False
+        for message in reversed(message_dicts):
+            if last_occurrence_idx_seen:
+                for field in fields_to_remove:
+                    if field in message:
+                        del message[field]
+            elif all(field in message for field in fields_to_remove):
+                last_occurrence_idx_seen = True
+
+        from nemo_gym.server_utils import get_response_json, raise_for_status
+
+        model_response = await self.ng_server_client.post(
+            server_name=os.getenv("NEMO_GYM_MODEL_SERVER_NAME"),
+            url_path="/v1/chat/completions",
+            json=params,
+            cookies=self.model_server_cookies,
+        )
+        # We raise for status here since we expect model calls to always work.
+        await raise_for_status(model_response)
+        model_response_json = await get_response_json(model_response)
+        self.model_server_cookies = model_response.cookies
+
+        response: ModelResponse = ModelResponse.model_validate(model_response_json)
+
+        response_message_dict = model_response_json["choices"][0]["message"]
+        provider_specific_fields = dict()
+        if response_message_dict.get("prompt_token_ids"):
+            provider_specific_fields = {
+                "prompt_token_ids": response_message_dict["prompt_token_ids"],
+                "generation_token_ids": response_message_dict["generation_token_ids"],
+                "generation_log_probs": response_message_dict["generation_log_probs"],
+            }
+            response._provider_specific_fields = provider_specific_fields
+
+        # Save the llm completion. See the original code in openhands/llm/llm.py
+        log_file = os.path.join(
+            self.llm.config.log_completions_folder,
+            f'{self.llm.config.model.replace("/", "__")}-{time.time()}.json',
+        )
+        _d = {
+            'messages': [m.model_dump() for m in messages],
+            'response': model_response_json,
+            'provider_specific_fields': provider_specific_fields,
+            # 'args': args,
+            'kwargs': {
+                k: v
+                for k, v in params.items()
+                if k not in ('messages', 'client')
+            },
+            'timestamp': time.time(),
+            # 'cost': cost,
+        }
+
+        temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(log_file))
+        with os.fdopen(temp_fd, 'w') as f:
+            f.write(json.dumps(_d))
+        os.replace(temp_path, log_file)
+
+        return response
 
     def _get_initial_user_message(self, history: list[Event]) -> MessageAction:
         """Finds the initial user message action from the full history."""

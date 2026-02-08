@@ -221,6 +221,12 @@ class LLM(RetryMixin, DebugMixin):
             cookie_value = raw_cookie.split(";")[0].strip()
             extra_headers["Cookie"] = cookie_value
 
+        # NeMo Gym: Grab params here for NeMo Gym client use downstream.
+        self._nemo_gym_llm_kwargs = kwargs | dict(
+            model=self.config.model,
+            seed=self.config.seed,
+        )
+
         self._completion = partial(
             litellm_completion,
             model=self.config.model,
