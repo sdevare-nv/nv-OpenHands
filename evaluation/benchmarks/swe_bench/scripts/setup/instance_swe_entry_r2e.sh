@@ -10,6 +10,13 @@ if [ -z "$SWE_INSTANCE_ID" ]; then
     exit 1
 fi
 
+# Install jq if not present (it is not installed by default in the r2e environments)
+if ! command -v jq >/dev/null 2>&1
+then
+    curl https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64 -Lo /bin/jq
+    chmod +x /bin/jq
+fi
+
 # Read the swe-bench-test-lite.json file and extract the required item based on instance_id
 item=$(jq --arg INSTANCE_ID "$SWE_INSTANCE_ID" '.[] | select(.instance_id == $INSTANCE_ID)' $SWEUTIL_DIR/eval_data/instances/swe-bench-instance.json)
 
@@ -31,14 +38,11 @@ if [ -d /workspace/$WORKSPACE_NAME ]; then
 fi
 
 # Use cp with hard links (-al) for near-instant copy
-# Falls back to regular copy if hard links fail (different filesystems)
+# Falls back to regular copy if hard links fail
 if ! cp -al /testbed /workspace/$WORKSPACE_NAME 2>/dev/null; then
     echo "Hard link copy failed, falling back to regular copy..."
     cp -r /testbed /workspace/$WORKSPACE_NAME
 fi
 
 # Activate instance-specific environment
-if [ -d /opt/miniconda3 ]; then
-    . /opt/miniconda3/etc/profile.d/conda.sh
-    conda activate testbed
-fi
+source /testbed/.venv/bin/activate

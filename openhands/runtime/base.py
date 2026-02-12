@@ -8,6 +8,7 @@ import shlex
 import shutil
 import string
 import tempfile
+import time
 from abc import abstractmethod
 from pathlib import Path
 from types import MappingProxyType
@@ -20,6 +21,7 @@ from openhands.core.config import OpenHandsConfig, SandboxConfig
 from openhands.core.config.mcp_config import MCPConfig, MCPStdioServerConfig
 from openhands.core.exceptions import (
     AgentRuntimeDisconnectedError,
+    AgentRuntimeTimeoutError,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.events import EventSource, EventStream, EventStreamSubscriber
@@ -35,6 +37,7 @@ from openhands.events.action import (
     FileWriteAction,
     IPythonRunCellAction,
     TaskTrackingAction,
+    ValidationFailureAction,
 )
 from openhands.events.action.mcp import MCPAction
 from openhands.events.event import Event
@@ -47,6 +50,7 @@ from openhands.events.observation import (
     Observation,
     TaskTrackingObservation,
     UserRejectObservation,
+    ValidationFailureObservation,
 )
 from openhands.events.serialization.action import ACTION_TYPE_TO_CLASS
 from openhands.integrations.provider import (
@@ -372,16 +376,49 @@ class Runtime(FileEditRuntimeMixin):
             # We don't block the command if this is a default timeout action
             event.set_hard_timeout(self.config.sandbox.timeout, blocking=False)
         assert event.timeout is not None
+
+        action_start_time = time.perf_counter()
+
         try:
             await self._export_latest_git_provider_tokens(event)
             if isinstance(event, MCPAction):
                 observation: Observation = await self.call_tool_mcp(event)
             else:
+                if hasattr(event, 'blocking'):
+                    blocking_val = event.blocking
+                else:
+                    blocking_val = False
+                event.set_hard_timeout(min(event.timeout,600), blocking=blocking_val)
                 observation = await call_sync_from_async(self.run_action, event)
+
+            observation._execution_latency = time.perf_counter() - action_start_time
         except PermissionError as e:
             # Handle PermissionError specially - convert to ErrorObservation
             # so the agent can receive feedback and continue execution
             observation = ErrorObservation(content=str(e))
+            observation._execution_latency = time.perf_counter() - action_start_time
+        except AgentRuntimeTimeoutError as e:
+            # Handle timeout errors by converting to ErrorObservation
+            # so the agent can receive feedback and try a different approach
+
+            # Try to kill any running process in the background
+            try:
+                self.log('warning', f'Action timed out after {event.timeout}s, attempting to kill running process...')
+                # Send Ctrl-C to interrupt the process
+                interrupt_action = CmdRunAction(command='C-c', is_input=True)
+                interrupt_action.set_hard_timeout(10, blocking=False)
+                interrupt_obs = self.run_action(interrupt_action)
+                self.log('debug', f'Interrupt signal sent: {interrupt_obs}')
+            except Exception as interrupt_error:
+                self.log('debug', f'Could not send interrupt signal: {interrupt_error}')
+
+            observation = ErrorObservation(
+                content=f'{type(e).__name__}: {str(e)}\n'
+                f'The previous action timed out (timeout: {event.timeout}s) and has been interrupted.\n'
+                'Consider trying a different approach, breaking the task into smaller steps, '
+                'or optimizing your command to complete within the time limit.'
+            )
+            observation._execution_latency = time.perf_counter() - action_start_time
         except (httpx.NetworkError, AgentRuntimeDisconnectedError) as e:
             runtime_status = RuntimeStatus.ERROR_RUNTIME_DISCONNECTED
             error_message = f'{type(e).__name__}: {str(e)}'
@@ -933,6 +970,12 @@ fi
         if not action.runnable:
             if isinstance(action, AgentThinkAction):
                 return AgentThinkObservation('Your thought has been logged.')
+            elif isinstance(action, ValidationFailureAction):
+                return ValidationFailureObservation(
+                    content=action.error_message,
+                    function_name=action.function_name,
+                    error_message=action.error_message,
+                )
             elif isinstance(action, TaskTrackingAction):
                 # Get the session-specific task file path
                 conversation_dir = get_conversation_dir(

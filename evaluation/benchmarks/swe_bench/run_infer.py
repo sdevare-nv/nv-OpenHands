@@ -3,8 +3,8 @@ import copy
 import json
 import os
 import tempfile
-from typing import Any, Literal
-
+from typing import Any, Literal, Optional
+import time
 import pandas as pd
 import toml
 from datasets import load_dataset
@@ -55,11 +55,12 @@ from openhands.core.config.utils import get_condenser_config_arg
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.main import create_runtime, run_controller
 from openhands.critic import AgentFinishedCritic
-from openhands.events.action import CmdRunAction, FileReadAction, MessageAction
+from openhands.events.action import  CmdRunAction, FileReadAction, MessageAction
 from openhands.events.observation import (
     CmdOutputObservation,
     ErrorObservation,
     FileReadObservation,
+    Observation,
 )
 from openhands.events.serialization.event import event_from_dict, event_to_dict
 from openhands.runtime.base import Runtime
@@ -68,11 +69,14 @@ from openhands.utils.shutdown_listener import sleep_if_should_continue
 
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
+ENABLE_BROWSER_FOR_SWEBENCH = os.environ.get('ENABLE_BROWSER_FOR_SWEBENCH', 'false').lower() == 'true'
 ENABLE_LLM_EDITOR = os.environ.get('ENABLE_LLM_EDITOR', 'false').lower() == 'true'
 BenchMode = Literal['swe', 'swt', 'swt-ci']
 
 # Global variable to track dataset type
 DATASET_TYPE = 'SWE-bench'
+
+MAX_RETRIES = 3
 
 
 def set_dataset_type(dataset_name: str) -> str:
@@ -80,8 +84,12 @@ def set_dataset_type(dataset_name: str) -> str:
     global DATASET_TYPE
     name_lower = dataset_name.lower()
 
-    if 'swe-gym' in name_lower:
+    if 'nv-internal-1' in name_lower:
+        DATASET_TYPE = 'nv-internal-1'
+    elif 'swe-gym' in name_lower:
         DATASET_TYPE = 'SWE-Gym'
+    elif 'r2e-gym' in name_lower:
+        DATASET_TYPE = 'R2E-Gym'
     elif 'swe-bench-live' in name_lower:
         DATASET_TYPE = 'SWE-bench-Live'
     elif 'swe-rebench' in name_lower:
@@ -92,7 +100,7 @@ def set_dataset_type(dataset_name: str) -> str:
         DATASET_TYPE = 'SWE-bench'
 
     logger.info(f'Dataset type set to: {DATASET_TYPE}')
-
+    os.environ['SWE_BENCH_DATASET_TYPE'] = DATASET_TYPE
 
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
     'CodeActAgent': codeact_user_response,
@@ -108,6 +116,7 @@ def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
 
 def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageAction:
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+    workspace_path = _get_workspace_path(instance, workspace_dir_name)
     mode = metadata.details['mode']
     llm_model = metadata.llm_config.model
 
@@ -138,7 +147,7 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageActio
     # Prepare context for rendering
     context = {
         'instance': instance,
-        'workspace_dir_name': workspace_dir_name,
+        'workspace_path': workspace_path,
         'metadata': metadata,  # Pass metadata if needed in templates
     }
 
@@ -189,6 +198,8 @@ def get_instance_docker_image(
             docker_image_prefix = 'docker.io/swebench/'
         elif DATASET_TYPE == 'SWE-rebench':
             docker_image_prefix = 'docker.io/swerebench/'
+        elif DATASET_TYPE in ['R2E-Gym', 'nv-internal-1']:
+            docker_image_prefix = 'UNAVAILABLE'
         repo, name = instance_id.split('__')
         image_name = f'{docker_image_prefix.rstrip("/")}/sweb.eval.x86_64.{repo}_1776_{name}:latest'.lower()
         logger.debug(f'Using official SWE-Bench image: {image_name}')
@@ -233,7 +244,7 @@ def get_config(
 
     config = get_openhands_config_for_eval(
         metadata=metadata,
-        enable_browser=RUN_WITH_BROWSING,
+        enable_browser=ENABLE_BROWSER_FOR_SWEBENCH,
         runtime=os.environ.get('RUNTIME', 'docker'),
         sandbox_config=sandbox_config,
     )
@@ -253,7 +264,7 @@ def get_config(
 
     agent_config = AgentConfig(
         enable_jupyter=False,
-        enable_browsing=RUN_WITH_BROWSING,
+        enable_browsing=ENABLE_BROWSER_FOR_SWEBENCH,
         enable_llm_editor=ENABLE_LLM_EDITOR,
         enable_mcp=False,
         condenser=metadata.condenser_config,
@@ -281,41 +292,32 @@ def initialize_runtime(
     logger.info('BEGIN Runtime Initialization Fn')
     logger.info('-' * 30)
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+    workspace_path = _get_workspace_path(instance, workspace_dir_name)
     obs: CmdOutputObservation
 
-    # Set instance id and git configuration
-    action = CmdRunAction(
-        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc && git config --global core.pager "" && git config --global diff.binary false"""
-    )
+    initial_setup_cmd = f"""
+echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && \
+echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && \
+echo "alias git='git --no-pager'" >> ~/.bashrc && \
+git config --global core.pager "" && \
+git config --global diff.binary false && \
+export USER=$(whoami) && \
+echo "USER=$USER" && \
+mkdir -p /swe_util/eval_data/instances && \
+source ~/.bashrc
+"""
+    action = CmdRunAction(command=initial_setup_cmd.strip())
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(
         obs.exit_code == 0,
-        f'Failed to export SWE_INSTANCE_ID and configure git: {str(obs)}',
+        f'Failed to run initial setup: {str(obs)}',
     )
-
-    action = CmdRunAction(command="""export USER=$(whoami); echo USER=${USER} """)
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(obs.exit_code == 0, f'Failed to export USER: {str(obs)}')
 
     # inject the init script
     script_dir = os.path.dirname(__file__)
-
-    # inject the instance info
-    action = CmdRunAction(command='mkdir -p /swe_util/eval_data/instances')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        obs.exit_code == 0,
-        f'Failed to create /swe_util/eval_data/instances: {str(obs)}',
-    )
 
     swe_instance_json_name = 'swe-bench-instance.json'
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -336,6 +338,10 @@ def initialize_runtime(
             entry_script_path = 'instance_swe_entry_live.sh'
         elif DATASET_TYPE == 'SWE-rebench':
             entry_script_path = 'instance_swe_entry_rebench.sh'
+        elif DATASET_TYPE == 'nv-internal-1':
+            entry_script_path = 'instance_swe_entry_nv_internal.sh'
+        elif DATASET_TYPE == 'R2E-Gym':
+            entry_script_path = 'instance_swe_entry_r2e.sh'
         else:
             entry_script_path = 'instance_swe_entry.sh'
         runtime.copy_to(
@@ -343,40 +349,42 @@ def initialize_runtime(
             '/swe_util/',
         )
 
-    action = CmdRunAction(command='cat ~/.bashrc')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(obs.exit_code == 0, f'Failed to cat ~/.bashrc: {str(obs)}')
+    # nv-internal-1 instances operate directly out of /app instead of /workspace.
+    if DATASET_TYPE != 'nv-internal-1':
+        action = CmdRunAction(command=f'source /swe_util/{entry_script_path}')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert_and_raise(
+            obs.exit_code == 0,
+            f'Failed to source /swe_util/{entry_script_path}: {str(obs)}',
+        )
+    elif instance.get("repo_language", "").lower() == "python":
+        # change python to the base python in the container and not the OpenHands venv
+        action = CmdRunAction(
+            command=(
+                "deactivate >/dev/null 2>&1 || true; unset VIRTUAL_ENV; "
+                "export PATH=/usr/bin:/bin:/usr/local/bin:$PATH; which python"
+            )
+        )
+        action.set_hard_timeout(600)
+        logger.info(action, extra={"msg_type": "ACTION"})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={"msg_type": "OBSERVATION"})
+        assert_and_raise(
+            obs.exit_code == 0,
+            f"Failed to deactivate and which python: {str(obs)}",
+        )
 
-    action = CmdRunAction(command='source ~/.bashrc')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    if isinstance(obs, ErrorObservation):
-        logger.error(f'Failed to source ~/.bashrc: {str(obs)}')
-    assert_and_raise(obs.exit_code == 0, f'Failed to source ~/.bashrc: {str(obs)}')
-
-    action = CmdRunAction(command=f'source /swe_util/{entry_script_path}')
+    action = CmdRunAction(command=f'cd {workspace_path}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(
         obs.exit_code == 0,
-        f'Failed to source /swe_util/{entry_script_path}: {str(obs)}',
-    )
-
-    action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = runtime.run_action(action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        obs.exit_code == 0,
-        f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
+        f'Failed to cd to {workspace_path}: {str(obs)}',
     )
 
     action = CmdRunAction(command='git reset --hard')
@@ -419,9 +427,9 @@ def initialize_runtime(
             obs = runtime.run_action(action)
             logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
-    if DATASET_TYPE != 'Multimodal' and DATASET_TYPE != 'SWE-bench-Live':
+    if DATASET_TYPE not in ('Multimodal', 'SWE-bench-Live', 'nv-internal-1'):
         # Only for non-multimodal datasets, we need to activate the testbed environment for Python
-        # SWE-Bench multimodal datasets and SWE-bench-Live are not using the testbed environment
+        # SWE-Bench multimodal datasets, SWE-bench-Live, and nv-internal-1 are not using the testbed environment
         action = CmdRunAction(command='which python')
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
@@ -436,6 +444,17 @@ def initialize_runtime(
     logger.info('END Runtime Initialization Fn')
     logger.info('-' * 30)
 
+def _get_workspace_path(
+    instance: pd.Series, workspace_dir_name: Optional[str] = None
+) -> str:
+    """Return the absolute workspace path expected by runtime commands."""
+    if workspace_dir_name is None:
+        workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+
+    if DATASET_TYPE == "nv-internal-1":
+        # nv-internal-1 instances operate directly out of /app instead of /workspace.
+        return "/app"
+    return f"/workspace/{workspace_dir_name}"
 
 def complete_runtime(
     runtime: Runtime,
@@ -452,8 +471,9 @@ def complete_runtime(
     logger.info('-' * 30)
     obs: CmdOutputObservation
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+    workspace_path = _get_workspace_path(instance, workspace_dir_name)
 
-    action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+    action = CmdRunAction(command=f'cd {workspace_path}')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -466,9 +486,14 @@ def complete_runtime(
         action = CmdRunAction(command='C-c')
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        if obs.exit_code == -1:
+            logger.info('C-c without is_input failed, retrying with is_input=True...')
+            action = CmdRunAction(command='C-c', is_input=True)
+            obs = runtime.run_action(action)
+            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
-        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action = CmdRunAction(command=f'cd {workspace_path}')
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
@@ -481,9 +506,14 @@ def complete_runtime(
         action = CmdRunAction(command='C-z')
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        if obs.exit_code == -1:
+            logger.info('C-z without is_input failed, retrying with is_input=True...')
+            action = CmdRunAction(command='C-z', is_input=True)
+            obs = runtime.run_action(action)
+            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
-        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action = CmdRunAction(command=f'cd {workspace_path}')
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
@@ -491,7 +521,7 @@ def complete_runtime(
 
     assert_and_raise(
         isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
+        f'Failed to cd to {workspace_path}: {str(obs)}',
     )
 
     action = CmdRunAction(command='git config --global core.pager ""')
@@ -606,12 +636,76 @@ def complete_runtime(
     return {'git_patch': git_patch}
 
 
+def _has_existing_result(eval_output_dir: str, instance_id: str) -> tuple[bool, dict | None]:
+    completions_dir = os.path.join(eval_output_dir, 'llm_completions', instance_id)
+    has_completions = False
+    if os.path.exists(completions_dir):
+        json_files = [f for f in os.listdir(completions_dir) if f.endswith('.json')]
+        has_completions = len(json_files) > 0
+
+    if not has_completions:
+        return False, None
+
+    output_file = os.path.join(eval_output_dir, 'output.jsonl')
+    existing_result = None
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                for line in f:
+                    try:
+                        result = json.loads(line.strip())
+                        if result.get('instance_id') == instance_id:
+                            git_patch = result.get('test_result', {}).get('git_patch', '')
+                            if git_patch and git_patch.strip():
+                                existing_result = result
+                                break
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.warning(f'Error reading output file for existing result: {e}')
+
+    if has_completions:
+        return True, existing_result
+
+    return False, None
+
+
 def process_instance(
     instance: pd.Series,
     metadata: EvalMetadata,
     reset_logger: bool = True,
     runtime_failure_count: int = 0,
 ) -> EvalOutput:
+
+    should_skip, existing_result = _has_existing_result(metadata.eval_output_dir, instance.instance_id)
+    if should_skip:
+        if existing_result:
+            return EvalOutput(
+                instance_id=existing_result.get('instance_id', instance.instance_id),
+                instruction=existing_result.get('instruction', ''),
+                instance=existing_result.get('instance', instance.to_dict()),
+                test_result=existing_result.get('test_result', {}),
+                metadata=metadata,
+                history=existing_result.get('history', []),
+                metrics=existing_result.get('metrics', {}),
+                error=existing_result.get('error'),
+            )
+        else:
+            return EvalOutput(
+                instance_id=instance.instance_id,
+                instruction='',
+                instance=instance.to_dict(),
+                test_result={
+                    'git_patch': '',
+                    'skipped': True,
+                    'skip_reason': 'completions_exist_no_result',
+                },
+                metadata=metadata,
+                history=[],
+                metrics={},
+                error=None,
+            )
+
     config = get_config(instance, metadata)
 
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
@@ -636,16 +730,24 @@ def process_instance(
     metadata.details['remote_runtime_resource_factor'] = (
         config.sandbox.remote_runtime_resource_factor
     )
-
+    start_time = time.perf_counter()
     runtime = create_runtime(config)
+    end_time = time.perf_counter()
+    print(f"create runtime: {end_time - start_time} seconds", flush = True)
+    start_time = time.perf_counter()
     call_async_from_sync(runtime.connect)
+    end_time = time.perf_counter()
+    print(f"connect to runtime: {end_time - start_time} seconds", flush = True)
 
     try:
+        start_time = time.perf_counter()
         initialize_runtime(runtime, instance, metadata)
-
+        end_time = time.perf_counter()
+        print(f"init runtime: {end_time - start_time} seconds", flush = True)
         message_action = get_instruction(instance, metadata)
 
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
+        start_time = time.perf_counter()
         state: State | None = asyncio.run(
             run_controller(
                 config=config,
@@ -656,6 +758,8 @@ def process_instance(
                 ],
             )
         )
+        end_time = time.perf_counter()
+        print(f"run controller: {end_time - start_time} seconds", flush = True)
 
         # if fatal error, throw EvalError to trigger re-run
         if is_fatal_evaluation_error(state.last_error):
@@ -694,6 +798,9 @@ def process_instance(
     histories = [event_to_dict(event) for event in state.history]
     metrics = get_metrics(state)
 
+    # Calculate action execution times from history
+    metrics['action_execution_latencies'] = get_action_execution_latencies(state.history)
+
     # Save the output
     instruction = message_action.content
     if message_action.image_urls:
@@ -713,36 +820,48 @@ def process_instance(
     return output
 
 
-def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
-    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.toml')
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as file:
-            data = toml.load(file)
-            if 'selected_ids' in data:
-                selected_ids = data['selected_ids']
-                logger.info(
-                    f'Filtering {len(selected_ids)} tasks from "selected_ids"...'
-                )
-                subset = dataset[dataset[filter_column].isin(selected_ids)]
-                logger.info(f'Retained {subset.shape[0]} tasks after filtering')
-                return subset
-            if 'selected_repos' in data:
-                # repos for the swe-bench instances:
-                # ['astropy/astropy', 'django/django', 'matplotlib/matplotlib', 'mwaskom/seaborn', 'pallets/flask', 'psf/requests', 'pydata/xarray', 'pylint-dev/pylint', 'pytest-dev/pytest', 'scikit-learn/scikit-learn', 'sphinx-doc/sphinx', 'sympy/sympy']
-                selected_repos = data['selected_repos']
-                if isinstance(selected_repos, str):
-                    selected_repos = [selected_repos]
-                assert isinstance(selected_repos, list)
-                logger.info(
-                    f'Filtering {selected_repos} tasks from "selected_repos"...'
-                )
-                subset = dataset[dataset['repo'].isin(selected_repos)]
-                logger.info(f'Retained {subset.shape[0]} tasks after filtering')
-                return subset
+def get_action_execution_latencies(history: list) -> list[dict]:
+    """Extract execution latencies from observations in the history."""
+    latencies = []
+    for event in history:
+        if isinstance(event, Observation):
+            execution_latency = getattr(event, '_execution_latency', None)
+            if execution_latency is None:
+                execution_latency = getattr(event, 'execution_latency', None)
+            if execution_latency is not None:
+                latencies.append({
+                    'observation_type': type(event).__name__,
+                    'observation_id': str(event.id),
+                    'latency': float(execution_latency),
+                    'message': event.message,
+                    'timestamp': event.timestamp,
+                })
+    return latencies
+
+
+def filter_dataset(
+    dataset: pd.DataFrame,
+    filter_column: str,
+    selected_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    # First check command-line args, then fall back to config.toml
+    if selected_ids is None:
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.toml')
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as file:
+                data = toml.load(file)
+                if 'selected_ids' in data:
+                    selected_ids = data['selected_ids']
+
+    if selected_ids:
+        logger.info(f'Filtering {len(selected_ids)} tasks from selected_ids...')
+        subset = dataset[dataset[filter_column].isin(selected_ids)]
+        logger.info(f'Retained {subset.shape[0]} tasks after filtering')
+        return subset
 
     skip_ids = os.environ.get('SKIP_IDS', '').split(',')
-    if len(skip_ids) > 0:
-        logger.info(f'Filtering {len(skip_ids)} tasks from "SKIP_IDS"...')
+    if len(skip_ids) > 0 and skip_ids[0]:
+        logger.info(f'Filtering {len(skip_ids)} tasks from SKIP_IDS...')
         return dataset[~dataset[filter_column].isin(skip_ids)]
     return dataset
 
@@ -768,36 +887,85 @@ if __name__ == '__main__':
         choices=['swe', 'swt', 'swt-ci'],
         help="mode to run the evaluation, either 'swe', 'swt', or 'swt-ci'",
     )
+    parser.add_argument(
+        '--selected-id',
+        type=str,
+        default=None,
+        help='Single instance ID to evaluate (e.g., "django__django-12345")',
+    )
+    parser.add_argument(
+        '--instance-dict-path',
+        type=str,
+        default=None,
+        help='Path to a JSON file containing instance data to use instead of loading from HuggingFace (e.g., \'{"instance_id": "...", "repo": "...", ...}\')',
+    )
 
     args, _ = parser.parse_known_args()
 
-    # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
-    # so we don't need to manage file uploading to OpenHands's repo
-    dataset = load_dataset(args.dataset, split=args.split)
+    # Validate nv-internal-1 requires instance_dict_path
+    if 'nv-internal-1' in args.dataset.lower():
+        if not args.instance_dict_path or not args.selected_id:
+            raise ValueError(
+                'nv-internal-1 dataset requires both --instance-dict-path and --selected-id arguments. '
+                'This dataset does not support HuggingFace dataset loading.'
+            )
 
-    # Set the global dataset type based on dataset name
-    set_dataset_type(args.dataset)
+    # Check if instance data is provided directly
+    if args.instance_dict_path and args.selected_id:
+        logger.info(f"Loading instance from --instance-dict-path: {args.instance_dict_path}")
+        with open(args.instance_dict_path, "r") as f:
+            instance_data = [json.loads(line) for line in f]
+            instance_data = [
+                instance_dict
+                for instance_dict in instance_data
+                if instance_dict["instance_id"] == args.selected_id
+            ][0]
 
-    swe_bench_tests = filter_dataset(dataset.to_pandas(), 'instance_id')
+        # delete the instance_dict_path to avoid information leakage
+        # os.remove(args.instance_dict_path)
+        swe_bench_tests = pd.DataFrame([instance_data])
+        logger.info(f"Loaded instance from --instance-dict-path: {instance_data.get('instance_id', 'unknown')}")
+        set_dataset_type(args.dataset)
+    else:
+        # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
+        # so we don't need to manage file uploading to OpenHands's repo
+        dataset = load_dataset(args.dataset, split=args.split)
+
+        # Set the global dataset type based on dataset name
+        set_dataset_type(args.dataset)
+
+        # Parse selected_id from args
+        selected_ids = [args.selected_id] if args.selected_id else None
+
+        swe_bench_tests = filter_dataset(dataset.to_pandas(), 'instance_id', selected_ids)
     logger.info(
         f'Loaded dataset {args.dataset} with split {args.split}: {len(swe_bench_tests)} tasks'
     )
-    if DATASET_TYPE == 'SWE-Gym':
-        with open(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'split',
-                'swegym_verified_instances.json',
-            ),
-            'r',
-        ) as f:
-            swegym_verified_instances = json.load(f)
-            swe_bench_tests = swe_bench_tests[
-                swe_bench_tests['instance_id'].isin(swegym_verified_instances)
-            ]
-        logger.info(
-            f'{len(swe_bench_tests)} tasks left after filtering for SWE-Gym verified instances'
-        )
+
+    # Insert dummy columns that OpenHands expects to be present
+    if "PASS_TO_PASS" not in swe_bench_tests:
+        swe_bench_tests["PASS_TO_PASS"] = "[]"
+    if "FAIL_TO_PASS" not in swe_bench_tests:
+        swe_bench_tests["FAIL_TO_PASS"] = "[]"
+    if "version" not in swe_bench_tests:
+        swe_bench_tests["version"] = "1.0"
+
+    # if DATASET_TYPE == 'SWE-Gym':
+    #     with open(
+    #         os.path.join(
+    #             os.path.dirname(os.path.abspath(__file__)),
+    #             'split',
+    #             'swegym_verified_instances.json',
+    #         ),
+    #         'r',
+    #     ) as f:
+    #         swegym_verified_instances = json.load(f)
+    #         swe_bench_tests = swe_bench_tests[
+    #             swe_bench_tests['instance_id'].isin(swegym_verified_instances)
+    #         ]
+    #     logger.info(
+    #         f'{len(swe_bench_tests)} tasks left after filtering for SWE-Gym verified instances'
+    #     )
 
     llm_config = None
     if args.llm_config:
@@ -876,7 +1044,7 @@ if __name__ == '__main__':
             timeout_seconds=8
             * 60
             * 60,  # 8 hour PER instance should be more than enough
-            max_retries=5,
+            max_retries=MAX_RETRIES,
         )
     else:
         critic = AgentFinishedCritic()
@@ -925,7 +1093,7 @@ if __name__ == '__main__':
                 timeout_seconds=8
                 * 60
                 * 60,  # 8 hour PER instance should be more than enough
-                max_retries=5,
+                max_retries=MAX_RETRIES,
             )
 
             # When eval is done, we update eval_ids to the instances that failed the current attempt

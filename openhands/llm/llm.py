@@ -6,6 +6,9 @@ from functools import partial
 from typing import Any, Callable, cast
 
 import httpx
+import uuid
+import tempfile
+
 
 from openhands.core.config import LLMConfig
 from openhands.llm.metrics import Metrics
@@ -50,6 +53,8 @@ LLM_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
     LLMNoResponseError,
 )
 
+SET_COOKIE_ID = "set-cookie"
+
 
 class LLM(RetryMixin, DebugMixin):
     """The LLM class represents a Language Model instance.
@@ -84,6 +89,10 @@ class LLM(RetryMixin, DebugMixin):
         self.model_info: ModelInfo | None = None
         self._function_calling_active: bool = False
         self.retry_listener = retry_listener
+
+        self.response_headers = None
+        self.x_client_id = str(uuid.uuid4())
+
         if self.config.log_completions:
             if self.config.log_completions_folder is None:
                 raise RuntimeError(
@@ -201,6 +210,17 @@ class LLM(RetryMixin, DebugMixin):
         if self.config.completion_kwargs is not None:
             kwargs.update(self.config.completion_kwargs)
 
+        raw_cookie = (
+                self.response_headers.get(SET_COOKIE_ID)
+                if self.response_headers and SET_COOKIE_ID in self.response_headers
+                else None
+            )
+        extra_headers = kwargs.get("extra_headers", {}).copy()
+        extra_headers["X-Client-ID"] = self.x_client_id
+        if raw_cookie:
+            cookie_value = raw_cookie.split(";")[0].strip()
+            extra_headers["Cookie"] = cookie_value
+
         self._completion = partial(
             litellm_completion,
             model=self.config.model,
@@ -213,6 +233,7 @@ class LLM(RetryMixin, DebugMixin):
             timeout=self.config.timeout,
             drop_params=self.config.drop_params,
             seed=self.config.seed,
+            extra_headers=extra_headers,
             **kwargs,
         )
 
@@ -262,6 +283,26 @@ class LLM(RetryMixin, DebugMixin):
                 )
             else:
                 messages = cast(list[dict[str, Any]], messages_list)
+
+            # Remove prompt_token_ids, generation_token_ids, and generation_log_probs from all messages except the last
+            # Store removed fields so we can restore them after the completion call
+            fields_to_remove = ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]
+            removed_fields: dict[int, dict[str, Any]] = {}
+
+            last_occurrence_idx = -1
+            for i, message in enumerate(reversed(messages)):
+                if all(field in message for field in fields_to_remove):
+                    last_occurrence_idx = len(messages) - i - 1
+                    break
+
+            for i, message in enumerate[dict](messages):
+                if i == last_occurrence_idx:
+                    continue
+                removed_fields[i] = {}
+                for field in fields_to_remove:
+                    if field in message:
+                        removed_fields[i][field] = message[field]
+                        del message[field]
 
             kwargs['messages'] = messages
 
@@ -320,7 +361,7 @@ class LLM(RetryMixin, DebugMixin):
                 kwargs.pop('extra_body', None)
 
             # Record start time for latency measurement
-            start_time = time.time()
+            start_time = time.perf_counter()
             # we don't support streaming here, thus we get a ModelResponse
 
             # Suppress httpx deprecation warnings during LiteLLM calls
@@ -337,10 +378,27 @@ class LLM(RetryMixin, DebugMixin):
                 )
                 resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
 
+                # Restore the removed token fields to messages
+                for i, fields in removed_fields.items():
+                    for field, value in fields.items():
+                        messages[i][field] = value
+
+                if not self.response_headers:
+                    self.response_headers = resp._response_headers
+
             # Calculate and record latency
-            latency = time.time() - start_time
+            latency = time.perf_counter() - start_time
             response_id = resp.get('id', 'unknown')
             self.metrics.add_response_latency(latency, response_id)
+
+            # Extract provider_specific_fields from the response
+            if hasattr(resp.choices[0].message, 'provider_specific_fields'):
+                provider_specific_fields = resp.choices[0].message.provider_specific_fields
+                # Store provider_specific_fields on the response for later use
+                if not hasattr(resp, '_provider_specific_fields'):
+                    resp._provider_specific_fields = provider_specific_fields
+            else:
+                provider_specific_fields = {}
 
             non_fncall_response = copy.deepcopy(resp)
 
@@ -391,6 +449,7 @@ class LLM(RetryMixin, DebugMixin):
                 _d = {
                     'messages': messages,
                     'response': resp,
+                    'provider_specific_fields': provider_specific_fields,
                     'args': args,
                     'kwargs': {
                         k: v
@@ -409,8 +468,10 @@ class LLM(RetryMixin, DebugMixin):
                     # Save fncall_messages/response separately
                     _d['fncall_messages'] = original_fncall_messages
                     _d['fncall_response'] = resp
-                with open(log_file, 'w') as f:
+                temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(log_file))
+                with os.fdopen(temp_fd, 'w') as f:
                     f.write(json.dumps(_d))
+                os.replace(temp_path, log_file)
 
             return resp
 

@@ -678,11 +678,11 @@ if __name__ == '__main__':
 
     # Start the file viewer server in a separate thread
     logger.info('Starting file viewer server')
-    _file_viewer_port = find_available_tcp_port(
-        min_port=args.port + 1, max_port=min(args.port + 1024, 65535)
-    )
-    server_url, _ = start_file_viewer_server(port=_file_viewer_port)
-    logger.info(f'File viewer server started at {server_url}')
+    # _file_viewer_port = find_available_tcp_port(
+    #     min_port=args.port + 1, max_port=min(args.port + 1024, 65535)
+    # )
+    # server_url, _ = start_file_viewer_server(port=_file_viewer_port)
+    # logger.info(f'File viewer server started at {server_url}')
 
     plugins_to_load: list[Plugin] = []
     if args.plugins:
@@ -712,9 +712,8 @@ if __name__ == '__main__':
         # Check if we're on Windows
         is_windows = sys.platform == 'win32'
 
-        # Initialize and mount MCP Proxy Manager (skip on Windows)
-        if is_windows:
-            logger.info('Skipping MCP Proxy initialization on Windows')
+        # Initialize and mount MCP Proxy Manager (skip on Windows or if disabled)
+        if True:
             mcp_proxy_manager = None
         else:
             logger.info('Initializing MCP Proxy Manager...')
@@ -1075,4 +1074,5 @@ if __name__ == '__main__':
     log_config = None
     if os.getenv('LOG_JSON', '0') in ('1', 'true', 'True'):
         log_config = get_uvicorn_json_log_config()
+
     run(app, host='0.0.0.0', port=args.port, log_config=log_config, use_colors=False)

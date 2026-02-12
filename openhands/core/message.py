@@ -66,6 +66,10 @@ class Message(BaseModel):
     name: str | None = None  # name of the tool
     # force string serializer
     force_string_serializer: bool = False
+    # token IDs from provider-specific fields
+    prompt_token_ids: list[int] | None = None
+    generation_token_ids: list[int] | None = None
+    generation_log_probs: list[float] | None = None
 
     @property
     def contains_image(self) -> bool:
@@ -154,5 +158,13 @@ class Message(BaseModel):
             )
             message_dict['tool_call_id'] = self.tool_call_id
             message_dict['name'] = self.name
+
+        # add token IDs if present (for assistant messages)
+        if self.prompt_token_ids is not None:
+            message_dict['prompt_token_ids'] = self.prompt_token_ids
+        if self.generation_token_ids is not None:
+            message_dict['generation_token_ids'] = self.generation_token_ids
+        if self.generation_log_probs is not None:
+            message_dict['generation_log_probs'] = self.generation_log_probs
 
         return message_dict

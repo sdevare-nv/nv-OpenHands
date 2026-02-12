@@ -240,3 +240,29 @@ class LoopRecoveryAction(Action):
 
     option: int = 1
     action: str = ActionType.LOOP_RECOVERY
+
+
+@dataclass
+class ValidationFailureAction(Action):
+    """An action that represents a validation failure for a function call.
+
+    This is returned when the LLM outputs an invalid function call (e.g., missing
+    required arguments, invalid argument values, malformed JSON).
+
+    Attributes:
+        function_name: The name of the function/tool that failed validation.
+        error_message: The error message describing the validation failure.
+        thought: The agent's explanation of its actions.
+        action: The action type, namely ActionType.VALIDATION_FAILURE.
+    """
+
+    function_name: str = ''
+    error_message: str = ''
+    thought: str = ''
+    action: str = ActionType.VALIDATION_FAILURE
+
+    @property
+    def message(self) -> str:
+        if self.function_name:
+            return f'Validation failure for {self.function_name}: {self.error_message}'
+        return f'Validation failure: {self.error_message}'

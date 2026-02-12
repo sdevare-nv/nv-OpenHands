@@ -45,6 +45,25 @@ class AgentThinkObservation(Observation):
 
 
 @dataclass
+class ValidationFailureObservation(Observation):
+    """The output of a validation failure action.
+
+    This is returned when the LLM outputs an invalid function call (e.g., missing
+    required arguments, invalid argument values, malformed JSON).
+    """
+
+    function_name: str = ''
+    error_message: str = ''
+    observation: str = ObservationType.VALIDATION_FAILURE
+
+    @property
+    def message(self) -> str:
+        if self.function_name:
+            return f'Validation failure for {self.function_name}: {self.error_message}'
+        return f'Validation failure: {self.error_message}'
+
+
+@dataclass
 class MicroagentKnowledge:
     """Represents knowledge from a triggered microagent.
 

@@ -1,7 +1,56 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-source "evaluation/utils/version_control.sh"
+# Remove this to allow running without version control
+# source "evaluation/utils/version_control.sh"
+
+checkout_eval_branch() {
+    if [ -z "$COMMIT_HASH" ]; then
+        echo "Commit hash not specified, use current git commit"
+        return 0
+    fi
+
+    if git diff --quiet $COMMIT_HASH HEAD; then
+        echo "The given hash is equivalent to the current HEAD"
+        return 0
+    fi
+
+    echo "Start to checkout openhands version to $COMMIT_HASH, but keep current evaluation harness"
+    if ! git diff-index --quiet HEAD --; then
+        echo "There are uncommitted changes, please stash or commit them first"
+        exit 1
+    fi
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    echo "Current version is: $current_branch"
+    echo "Check out OpenHands to version: $COMMIT_HASH"
+    if ! git checkout $COMMIT_HASH; then
+        echo "Failed to check out to $COMMIT_HASH"
+        exit 1
+    fi
+
+    echo "Revert changes in evaluation folder"
+    git checkout $current_branch -- evaluation
+
+    # Trap the EXIT signal to checkout original branch
+    trap checkout_original_branch EXIT
+
+}
+
+
+checkout_original_branch() {
+    if [ -z "$current_branch" ]; then
+        return 0
+    fi
+    echo "Checkout back to original branch $current_branch"
+    git checkout $current_branch
+}
+
+get_openhands_version() {
+    # IMPORTANT: Because Agent's prompt changes fairly often in the rapidly evolving codebase of OpenHands
+    # We need to track the version of Agent in the evaluation to make sure results are comparable
+    OPENHANDS_VERSION=v$(poetry run python -c "from openhands import get_version; print(get_version())")
+}
+
 
 MODEL_CONFIG=$1
 COMMIT_HASH=$2
@@ -11,9 +60,12 @@ MAX_ITER=$5
 NUM_WORKERS=$6
 DATASET=$7
 SPLIT=$8
-N_RUNS=$9
-MODE=${10}
-
+EVAL_OUTPUT_DIR=${9}
+SELECTED_ID=${10}
+INSTANCE_DICT_PATH=${11}
+CONFIG_FILE=${12}
+N_RUNS=${13}
+MODE=${14}
 
 if [ -z "$NUM_WORKERS" ]; then
   NUM_WORKERS=1
@@ -58,6 +110,11 @@ else
   echo "No Condenser Config provided via EVAL_CONDENSER, use default (NoOpCondenser)."
 fi
 
+if [ -z "$CONFIG_FILE" ]; then
+  echo "CONFIG_FILE not specified, use default config.toml"
+  CONFIG_FILE="config.toml"
+fi
+
 export RUN_WITH_BROWSING=$RUN_WITH_BROWSING
 echo "RUN_WITH_BROWSING: $RUN_WITH_BROWSING"
 
@@ -73,6 +130,11 @@ echo "NUM_WORKERS: $NUM_WORKERS"
 echo "COMMIT_HASH: $COMMIT_HASH"
 echo "MODE: $MODE"
 echo "EVAL_CONDENSER: $EVAL_CONDENSER"
+echo "EVAL_OUTPUT_DIR: $EVAL_OUTPUT_DIR"
+echo "SELECTED_ID: $SELECTED_ID"
+echo "INSTANCE_DICT_PATH: $INSTANCE_DICT_PATH"
+echo "TMUX_MEMORY_LIMIT: $TMUX_MEMORY_LIMIT"
+echo "COMMAND_EXEC_TIMEOUT: $COMMAND_EXEC_TIMEOUT"
 
 # Default to NOT use Hint
 if [ -z "$USE_HINT_TEXT" ]; then
@@ -113,11 +175,28 @@ function run_eval() {
     --split $SPLIT \
     --mode $MODE"
 
-
+  if [ -n "$EVAL_OUTPUT_DIR" ]; then
+    COMMAND="$COMMAND --eval-output-dir $EVAL_OUTPUT_DIR"
+  fi
 
   if [ -n "$EVAL_LIMIT" ]; then
     echo "EVAL_LIMIT: $EVAL_LIMIT"
     COMMAND="$COMMAND --eval-n-limit $EVAL_LIMIT"
+  fi
+
+  if [ -n "$SELECTED_ID" ]; then
+    echo "SELECTED_ID: $SELECTED_ID"
+    COMMAND="$COMMAND --selected-id \"$SELECTED_ID\""
+  fi
+
+  if [ -n "$INSTANCE_DICT_PATH" ]; then
+    echo "INSTANCE_DICT: Using provided instance dictionary"
+    COMMAND="$COMMAND --instance-dict-path $INSTANCE_DICT_PATH"
+  fi
+
+  if [ -n "$CONFIG_FILE" ]; then
+    echo "CONFIG_FILE: $CONFIG_FILE"
+    COMMAND="$COMMAND --config-file $CONFIG_FILE"
   fi
 
   # Run the command

@@ -4,6 +4,7 @@ from openhands.events.observation.agent import (
     AgentStateChangedObservation,
     AgentThinkObservation,
     RecallObservation,
+    ValidationFailureObservation,
 )
 from openhands.events.observation.browse import BrowserOutputObservation
 from openhands.events.observation.commands import (
@@ -52,4 +53,5 @@ __all__ = [
     'MCPObservation',
     'FileDownloadObservation',
     'TaskTrackingObservation',
+    'ValidationFailureObservation',
 ]
