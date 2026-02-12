@@ -231,12 +231,19 @@ def response_to_actions(
         )
         actions.append(message_action)
 
-    # Add response id to actions
-    # This will ensure we can match both actions without tool calls (e.g. MessageAction)
-    # and actions with tool calls (e.g. CmdRunAction, IPythonRunCellAction, etc.)
-    # with the token usage data
+    # Add response id and provider-specific fields to actions
+    # Extract provider_specific_fields from the response if available
+    provider_specific_fields = getattr(response, '_provider_specific_fields', {})
+
     for action in actions:
         action.response_id = response.id
+        # Set provider-specific fields if they exist
+        if 'prompt_token_ids' in provider_specific_fields:
+            action.prompt_token_ids = provider_specific_fields['prompt_token_ids']
+        if 'generation_token_ids' in provider_specific_fields:
+            action.generation_token_ids = provider_specific_fields['generation_token_ids']
+        if 'generation_log_probs' in provider_specific_fields:
+            action.generation_log_probs = provider_specific_fields['generation_log_probs']
 
     assert len(actions) >= 1
     return actions

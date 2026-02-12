@@ -129,3 +129,34 @@ class Event:
     @response_id.setter
     def response_id(self, value: str) -> None:
         self._response_id = value
+
+    # optional fields, provider-specific data from LLM response
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        if hasattr(self, '_prompt_token_ids'):
+            return self._prompt_token_ids  # type: ignore[attr-defined]
+        return None
+
+    @prompt_token_ids.setter
+    def prompt_token_ids(self, value: list[int]) -> None:
+        self._prompt_token_ids = value
+
+    @property
+    def generation_token_ids(self) -> list[int] | None:
+        if hasattr(self, '_generation_token_ids'):
+            return self._generation_token_ids  # type: ignore[attr-defined]
+        return None
+
+    @generation_token_ids.setter
+    def generation_token_ids(self, value: list[int]) -> None:
+        self._generation_token_ids = value
+
+    @property
+    def generation_log_probs(self) -> list[float] | None:
+        if hasattr(self, '_generation_log_probs'):
+            return self._generation_log_probs  # type: ignore[attr-defined]
+        return None
+
+    @generation_log_probs.setter
+    def generation_log_probs(self, value: list[float]) -> None:
+        self._generation_log_probs = value

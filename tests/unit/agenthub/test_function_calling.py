@@ -14,6 +14,7 @@ from openhands.events.action import (
     FileEditAction,
     FileReadAction,
     IPythonRunCellAction,
+    MessageAction,
 )
 from openhands.events.event import FileEditSource, FileReadSource
 
@@ -272,3 +273,35 @@ def test_unexpected_argument_handling():
     # Verify the error message mentions the unexpected argument
     assert 'old_str_prefix' in str(exc_info.value)
     assert 'Unexpected argument' in str(exc_info.value)
+
+
+def test_message_action_has_provider_specific_fields():
+    """Test that MessageAction gets provider-specific fields from LLM response."""
+    response = ModelResponse(
+        id='mock-response-id',
+        choices=[
+            {
+                'message': {
+                    'content': 'This is a text response',
+                    'role': 'assistant',
+                },
+                'index': 0,
+                'finish_reason': 'stop',
+            }
+        ],
+    )
+    # Simulate provider-specific fields being set on response
+    response._provider_specific_fields = {
+        'prompt_token_ids': [1, 2, 3, 4],
+        'generation_token_ids': [5, 6, 7],
+        'generation_log_probs': [-0.1, -0.2, -0.3],
+    }
+
+    actions = response_to_actions(response)
+    assert len(actions) == 1
+    assert isinstance(actions[0], MessageAction)
+    assert actions[0].content == 'This is a text response'
+    assert actions[0].response_id == 'mock-response-id'
+    assert actions[0].prompt_token_ids == [1, 2, 3, 4]
+    assert actions[0].generation_token_ids == [5, 6, 7]
+    assert actions[0].generation_log_probs == [-0.1, -0.2, -0.3]

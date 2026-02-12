@@ -327,26 +327,13 @@ class ConversationMemory:
             if role not in ('user', 'system', 'assistant', 'tool'):
                 raise ValueError(f'Invalid role: {role}')
 
-            # Extract provider_specific_fields if available (for assistant messages)
-            provider_specific_fields = {}
-            if role == 'assistant' and action.tool_call_metadata is not None:
-                provider_specific_fields = getattr(
-                    action.tool_call_metadata.model_response,
-                    '_provider_specific_fields',
-                    {},
-                )
-
             return [
                 Message(
                     role=role,  # type: ignore[arg-type]
                     content=content,
-                    prompt_token_ids=provider_specific_fields.get('prompt_token_ids'),
-                    generation_token_ids=provider_specific_fields.get(
-                        'generation_token_ids'
-                    ),
-                    generation_log_probs=provider_specific_fields.get(
-                        'generation_log_probs'
-                    ),
+                    prompt_token_ids=action.prompt_token_ids,
+                    generation_token_ids=action.generation_token_ids,
+                    generation_log_probs=action.generation_log_probs,
                 )
             ]
         elif isinstance(action, CmdRunAction) and action.source == 'user':
