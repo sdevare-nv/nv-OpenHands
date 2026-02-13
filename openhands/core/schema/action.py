@@ -120,3 +120,15 @@ class ActionType(str, Enum):
     OPENCODE_WRITE = 'opencode_write'
     """Writes a file with LSP diagnostics after write."""
 
+    QUESTION = 'question'
+    """Asks the user structured questions."""
+
+    APPLY_PATCH = 'apply_patch'
+    """Applies a unified diff patch to files."""
+
+    TODO_READ = 'todo_read'
+    """Reads the current task/todo list."""
+
+    TODO_WRITE = 'todo_write'
+    """Creates or updates tasks in the todo list."""
+

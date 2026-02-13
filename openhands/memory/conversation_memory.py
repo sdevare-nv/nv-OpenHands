@@ -22,11 +22,15 @@ from openhands.events.action import (
 )
 from openhands.events.action.mcp import MCPAction
 from openhands.events.action.opencode import (
+    ApplyPatchAction,
     GlobAction,
     GrepAction,
     ListDirAction,
     OpenCodeReadAction,
     OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
 )
 from openhands.events.action.message import SystemMessageAction
 from openhands.events.event import Event, RecallType
@@ -34,6 +38,7 @@ from openhands.events.observation import (
     AgentCondensationObservation,
     AgentDelegateObservation,
     AgentThinkObservation,
+    ApplyPatchObservation,
     BrowserOutputObservation,
     CmdOutputObservation,
     FileDownloadObservation,
@@ -42,7 +47,10 @@ from openhands.events.observation import (
     FileWriteObservation,
     IPythonRunCellObservation,
     LoopDetectionObservation,
+    QuestionObservation,
     TaskTrackingObservation,
+    TodoReadObservation,
+    TodoWriteObservation,
     UserRejectObservation,
 )
 from openhands.events.observation.agent import (
@@ -246,6 +254,10 @@ class ConversationMemory:
                 ListDirAction,
                 OpenCodeReadAction,
                 OpenCodeWriteAction,
+                QuestionAction,
+                ApplyPatchAction,
+                TodoReadAction,
+                TodoWriteAction,
             ),
         ) or (isinstance(action, CmdRunAction) and action.source == 'agent'):
             tool_metadata = action.tool_call_metadata
@@ -572,6 +584,18 @@ class ConversationMemory:
             text = truncate_content(obs.content, max_message_chars)
             message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, FileDownloadObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, TodoReadObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, TodoWriteObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, QuestionObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, ApplyPatchObservation):
             text = truncate_content(obs.content, max_message_chars)
             message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, LoopDetectionObservation):

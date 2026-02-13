@@ -17,6 +17,8 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from zipfile import ZipFile
+import glob as glob_module
+import subprocess
 
 import puremagic
 from binaryornot.check import is_binary
@@ -44,6 +46,7 @@ from openhands.core.logger import get_uvicorn_json_log_config
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
     Action,
+    ApplyPatchAction,
     BrowseInteractiveAction,
     BrowseURLAction,
     CmdRunAction,
@@ -56,6 +59,9 @@ from openhands.events.action import (
     ListDirAction,
     OpenCodeReadAction,
     OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
 )
 from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
@@ -67,6 +73,12 @@ from openhands.events.observation import (
     FileWriteObservation,
     IPythonRunCellObservation,
     Observation,
+    TodoReadObservation,
+    TodoWriteObservation,
+)
+from openhands.events.observation.opencode import (
+    ApplyPatchObservation,
+    QuestionObservation,
 )
 from openhands.events.serialization import event_from_dict, event_to_dict
 from openhands.runtime.browser import browse
@@ -216,6 +228,7 @@ class ActionExecutor:
         self._initialized = False
         self.downloaded_files: list[str] = []
         self.downloads_directory = '/workspace/.downloads'
+        self._todos: list[dict] = []  # In-memory todo list storage
 
         self.max_memory_gb: int | None = None
         if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', None):
@@ -817,49 +830,55 @@ class ActionExecutor:
         return FileWriteObservation(content=output, path=filepath)
 
     async def glob(self, action: GlobAction) -> Observation:
-        """Execute glob file search using ripgrep or find."""
+        """Execute glob file search using ripgrep or Python glob."""
         assert self.bash_session is not None
         working_dir = self.bash_session.cwd
         search_path = self._resolve_path(action.path, working_dir)
 
-        import subprocess
+        # Auto-prepend **/ to patterns without a path separator so that
+        # simple patterns like "*.py" search recursively instead of only
+        # matching at the root of the search path.
+        pattern = action.pattern
+        if '/' not in pattern:
+            pattern = '**/' + pattern
 
         files = []
         truncated = False
         limit = 100
 
-        # Try ripgrep first (respects .gitignore, sorts by mtime)
+        # Try ripgrep first (fast, respects .gitignore)
+        # Note: avoid --sortr flag as it requires ripgrep >= 13.0.0
         try:
             result = subprocess.run(
-                ['rg', '--files', '-g', action.pattern, '--sortr', 'modified', search_path],
+                ['rg', '--files', '-g', pattern, search_path],
                 capture_output=True, text=True, timeout=30, cwd=working_dir
             )
             if result.returncode == 0 and result.stdout.strip():
-                all_files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
-                if len(all_files) > limit:
-                    truncated = True
-                files = all_files[:limit]
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-        # Fallback to find with mtime sorting
+        # Fallback to Python's glob module (handles ** patterns natively)
         if not files:
             try:
-                result = subprocess.run(
-                    ['find', search_path, '-type', 'f', '-name', action.pattern,
-                     '-printf', '%T@ %p\n'],
-                    capture_output=True, text=True, timeout=30, cwd=working_dir
-                )
-                if result.stdout.strip():
-                    lines = result.stdout.strip().split('\n')
-                    # Sort by mtime (first field) descending
-                    sorted_lines = sorted(lines, key=lambda x: float(x.split()[0]) if x else 0, reverse=True)
-                    all_files = [' '.join(l.split()[1:]) for l in sorted_lines if l]
-                    if len(all_files) > limit:
-                        truncated = True
-                    files = all_files[:limit]
-            except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+                full_pattern = os.path.join(search_path, pattern)
+                files = [
+                    f for f in glob_module.glob(full_pattern, recursive=True)
+                    if os.path.isfile(f)
+                ]
+            except Exception:
                 pass
+
+        # Sort by modification time (newest first)
+        try:
+            files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+        except (OSError, ValueError):
+            pass
+
+        # Apply limit
+        if len(files) > limit:
+            truncated = True
+            files = files[:limit]
 
         # Build output
         if not files:
@@ -876,56 +895,80 @@ class ActionExecutor:
         )
 
     async def grep(self, action: GrepAction) -> Observation:
-        """Execute grep content search using ripgrep or grep."""
+        """Execute grep content search using ripgrep or grep.
+
+        Results are sorted by file modification time (newest first) and limited
+        to 100 matches.  Uses ripgrep when available (respects .gitignore) with
+        a fallback to grep -E for extended regex support (e.g. | alternation).
+        """
         assert self.bash_session is not None
         working_dir = self.bash_session.cwd
         search_path = self._resolve_path(action.path, working_dir)
 
         import subprocess
 
-        output = ""
+        raw_lines: list[str] = []
         limit = 100
+
+        # Ensure include pattern matches recursively (e.g., "*.py" -> "**/*.py")
+        include = action.include
+        if include and not include.startswith('**/'):
+            include = '**/' + include
 
         # Try ripgrep first (respects .gitignore)
         try:
             cmd = ['rg', '-n', action.pattern, search_path]
-            if action.include:
-                cmd = ['rg', '-n', '-g', action.include, action.pattern, search_path]
+            if include:
+                cmd = ['rg', '-n', '-g', include, action.pattern, search_path]
 
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=30, cwd=working_dir
             )
             if result.stdout.strip():
-                lines = result.stdout.strip().split('\n')
-                if len(lines) > limit:
-                    output = '\n'.join(lines[:limit])
-                    output += f'\n\n(Results truncated, showing {limit} of {len(lines)}+ matches)'
-                else:
-                    output = '\n'.join(lines)
+                raw_lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-        # Fallback to grep
-        if not output:
+        # Fallback to grep -E (extended regex for | alternation support)
+        if not raw_lines:
             try:
                 if action.include:
-                    # Use find + grep for file filtering
+                    # Use find + grep -E for file filtering with extended regex
                     result = subprocess.run(
                         f'find {search_path} -type f -name "{action.include}" '
-                        f'-exec grep -Hn "{action.pattern}" {{}} \\; 2>/dev/null | head -{limit}',
+                        f'-exec grep -EHn "{action.pattern}" {{}} \\; 2>/dev/null',
                         shell=True, capture_output=True, text=True, timeout=30, cwd=working_dir
                     )
                 else:
                     result = subprocess.run(
-                        f'grep -rn "{action.pattern}" {search_path} 2>/dev/null | head -{limit}',
+                        f'grep -Ern "{action.pattern}" {search_path} 2>/dev/null',
                         shell=True, capture_output=True, text=True, timeout=30, cwd=working_dir
                     )
-                output = result.stdout.strip() or "No matches found"
+                if result.stdout.strip():
+                    raw_lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
             except (subprocess.TimeoutExpired, Exception):
-                output = "No matches found"
+                pass
 
-        if not output:
+        if not raw_lines:
             output = "No matches found"
+        else:
+            # Sort results by file modification time (newest first).
+            # Each line has the format  filepath:linenum:content
+            def _mtime_key(line: str) -> float:
+                filepath = line.split(':')[0]
+                try:
+                    return os.path.getmtime(filepath)
+                except OSError:
+                    return 0.0
+
+            raw_lines.sort(key=_mtime_key, reverse=True)
+
+            # Apply limit
+            if len(raw_lines) > limit:
+                output = '\n'.join(raw_lines[:limit])
+                output += f'\n\n(Results truncated, showing {limit} of {len(raw_lines)}+ matches)'
+            else:
+                output = '\n'.join(raw_lines)
 
         return CmdOutputObservation(
             content=output,
@@ -1042,6 +1085,104 @@ class ActionExecutor:
             command_id=-1,
             command=f"list_dir {action.path}",
         )
+
+    async def question(self, action: QuestionAction) -> Observation:
+        """Handle a question action. Returns an observation with the questions.
+
+        Note: In a full implementation, this would interact with the user.
+        In sandbox/evaluation mode, we return the questions as-is since
+        the controller handles user interaction.
+        """
+        return QuestionObservation(
+            content=json.dumps(action.questions, indent=2),
+            questions=action.questions,
+        )
+
+    async def apply_patch(self, action: ApplyPatchAction) -> Observation:
+        """Apply a unified diff patch to files."""
+        assert self.bash_session is not None
+        try:
+            # Write the patch to a temporary file and apply with git apply
+            import tempfile
+            patch_text = action.patchText
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.patch', delete=False
+            ) as f:
+                f.write(patch_text)
+                patch_file = f.name
+
+            try:
+                result = subprocess.run(
+                    ['git', 'apply', '--verbose', patch_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=self.bash_session.cwd,
+                )
+                if result.returncode == 0:
+                    output = result.stdout.strip() or 'Patch applied successfully.'
+                    # Try to extract changed files from verbose output
+                    files_changed = [
+                        line.split(':')[0].strip()
+                        for line in result.stderr.strip().split('\n')
+                        if line.strip()
+                    ]
+                    return ApplyPatchObservation(
+                        content=output,
+                        files_changed=files_changed,
+                        success=True,
+                    )
+                else:
+                    error_msg = result.stderr.strip() or result.stdout.strip()
+                    return ApplyPatchObservation(
+                        content=f'Failed to apply patch: {error_msg}',
+                        success=False,
+                    )
+            finally:
+                os.unlink(patch_file)
+        except Exception as e:
+            logger.exception(f'Error applying patch: {e}')
+            return ErrorObservation(f'Failed to apply patch: {str(e)}')
+
+    async def todo_read(self, action: TodoReadAction) -> Observation:
+        """Read the current todo list."""
+        return TodoReadObservation(
+            content=json.dumps(self._todos, indent=2) if self._todos else '[]',
+            todos=list(self._todos),
+        )
+
+    async def todo_write(self, action: TodoWriteAction) -> Observation:
+        """Update the todo list with new or modified items."""
+        try:
+            incoming_todos = action.todos
+            if not isinstance(incoming_todos, list):
+                return ErrorObservation('todos must be a list of todo objects')
+
+            # Build index of existing todos by id
+            existing_by_id = {t['id']: t for t in self._todos if 'id' in t}
+
+            # Merge incoming todos: update existing by id, add new ones
+            for todo in incoming_todos:
+                if not isinstance(todo, dict):
+                    continue
+                todo_id = todo.get('id')
+                if todo_id and todo_id in existing_by_id:
+                    # Update existing todo
+                    existing_by_id[todo_id].update(todo)
+                else:
+                    # Add new todo
+                    self._todos.append(todo)
+                    if todo_id:
+                        existing_by_id[todo_id] = todo
+
+            return TodoWriteObservation(
+                content=json.dumps(self._todos, indent=2),
+                todos=list(self._todos),
+                success=True,
+            )
+        except Exception as e:
+            logger.exception(f'Error updating todos: {e}')
+            return ErrorObservation(f'Failed to update todos: {str(e)}')
 
     async def browse(self, action: BrowseURLAction) -> Observation:
         if self.browser is None:

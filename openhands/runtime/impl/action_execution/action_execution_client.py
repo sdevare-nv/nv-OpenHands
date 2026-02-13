@@ -32,11 +32,15 @@ from openhands.events.action import (
     ValidationFailureAction,
 )
 from openhands.events.action.opencode import (
+    ApplyPatchAction,
     GlobAction,
     GrepAction,
     ListDirAction,
     OpenCodeReadAction,
     OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
 )
 from openhands.events.action.action import Action
 from openhands.events.action.files import FileEditSource
@@ -394,6 +398,18 @@ class ActionExecutionClient(Runtime):
         return self.send_action_for_execution(action)
 
     def opencode_write(self, action: OpenCodeWriteAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def question(self, action: QuestionAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def apply_patch(self, action: ApplyPatchAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def todo_read(self, action: TodoReadAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def todo_write(self, action: TodoWriteAction) -> Observation:
         return self.send_action_for_execution(action)
 
     def get_mcp_config(

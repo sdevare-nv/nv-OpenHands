@@ -28,11 +28,15 @@ from openhands.events.action.files import (
 from openhands.events.action.mcp import MCPAction
 from openhands.events.action.message import MessageAction, SystemMessageAction
 from openhands.events.action.opencode import (
+    ApplyPatchAction,
     GlobAction,
     GrepAction,
     ListDirAction,
     OpenCodeReadAction,
     OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
 )
 
 actions = (
@@ -63,6 +67,10 @@ actions = (
     ListDirAction,
     OpenCodeReadAction,
     OpenCodeWriteAction,
+    QuestionAction,
+    ApplyPatchAction,
+    TodoReadAction,
+    TodoWriteAction,
 )
 
 ACTION_TYPE_TO_CLASS = {action_class.action: action_class for action_class in actions}  # type: ignore[attr-defined]

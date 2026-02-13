@@ -179,3 +179,97 @@ class ListDirAction(Action):
     @property
     def message(self) -> str:
         return f"Listing directory: {self.path or 'current directory'}"
+
+
+@dataclass
+class QuestionAction(Action):
+    """Asks the user structured questions for clarification.
+
+    Features:
+    - Present one or more questions with options
+    - Supports single-select and multi-select questions
+
+    Attributes:
+        questions: List of question objects, each with id, prompt, and options
+    """
+
+    questions: list[dict] = field(default_factory=list)
+    thought: str = ""
+    action: str = ActionType.QUESTION
+    runnable: ClassVar[bool] = True
+    security_risk: ActionSecurityRisk = ActionSecurityRisk.UNKNOWN
+
+    @property
+    def message(self) -> str:
+        count = len(self.questions)
+        return f"Asking {count} question{'s' if count != 1 else ''}"
+
+
+@dataclass
+class ApplyPatchAction(Action):
+    """Applies a unified diff patch to one or more files.
+
+    Features:
+    - Applies unified diff format patches
+    - Supports multi-file patches
+
+    Attributes:
+        patchText: The unified diff patch text to apply
+    """
+
+    patchText: str = ""
+    thought: str = ""
+    action: str = ActionType.APPLY_PATCH
+    runnable: ClassVar[bool] = True
+    security_risk: ActionSecurityRisk = ActionSecurityRisk.UNKNOWN
+
+    @property
+    def message(self) -> str:
+        return "Applying patch"
+
+
+@dataclass
+class TodoReadAction(Action):
+    """Reads the current todo/task list.
+
+    Features:
+    - Retrieves all current todos and their status
+    - No parameters required
+
+    Returns:
+    - JSON array of todo items with their current status
+    """
+
+    thought: str = ""
+    action: str = ActionType.TODO_READ
+    runnable: ClassVar[bool] = True
+    security_risk: ActionSecurityRisk = ActionSecurityRisk.UNKNOWN
+
+    @property
+    def message(self) -> str:
+        return "Reading todo list"
+
+
+@dataclass
+class TodoWriteAction(Action):
+    """Creates or updates tasks in the todo list.
+
+    Features:
+    - Create new todo items with id, title, status, and optional description
+    - Update existing todo items by id
+    - Track task states: pending, in_progress, completed, cancelled
+
+    Attributes:
+        todos: List of todo objects, each with id, title, status, and optional description
+    """
+
+    todos: list[dict] = field(default_factory=list)
+    thought: str = ""
+    action: str = ActionType.TODO_WRITE
+    runnable: ClassVar[bool] = True
+    security_risk: ActionSecurityRisk = ActionSecurityRisk.UNKNOWN
+
+    @property
+    def message(self) -> str:
+        count = len(self.todos)
+        return f"Updating {count} todo{'s' if count != 1 else ''}"
