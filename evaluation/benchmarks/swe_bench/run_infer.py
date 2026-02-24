@@ -32,6 +32,7 @@ from evaluation.utils.shared import (
     codeact_user_response,
     codex_user_response,
     opencode_user_response,
+    swe_agent_user_response,
     get_default_sandbox_config_for_eval,
     get_metrics,
     get_openhands_config_for_eval,
@@ -108,6 +109,7 @@ AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
     'CodeActAgent': codeact_user_response,
     'OpenCodeAgent': opencode_user_response,
     'CodexAgent': codex_user_response,
+    'SWEAgent': swe_agent_user_response,
 }
 
 
