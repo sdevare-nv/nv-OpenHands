@@ -27,6 +27,25 @@ from openhands.events.action.files import (
 )
 from openhands.events.action.mcp import MCPAction
 from openhands.events.action.message import MessageAction, SystemMessageAction
+from openhands.events.action.opencode import (
+    ApplyPatchAction,
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
+)
+from openhands.events.action.codex import (
+    CodexApplyPatchAction,
+    CodexGrepFilesAction,
+    CodexListDirAction,
+    CodexReadFileAction,
+    CodexUpdatePlanAction,
+)
+from openhands.events.action.terminus_2 import Terminus2CmdRunAction
 
 actions = (
     NullAction,
@@ -50,6 +69,24 @@ actions = (
     MCPAction,
     TaskTrackingAction,
     LoopRecoveryAction,
+    # OpenCode-style actions
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+    QuestionAction,
+    ApplyPatchAction,
+    TodoReadAction,
+    TodoWriteAction,
+    # Codex-style actions
+    CodexReadFileAction,
+    CodexListDirAction,
+    CodexGrepFilesAction,
+    CodexApplyPatchAction,
+    CodexUpdatePlanAction,
+    # Terminus-2-style actions
+    Terminus2CmdRunAction,
 )
 
 ACTION_TYPE_TO_CLASS = {action_class.action: action_class for action_class in actions}  # type: ignore[attr-defined]

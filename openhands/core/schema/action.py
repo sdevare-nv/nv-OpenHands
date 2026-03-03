@@ -103,3 +103,51 @@ class ActionType(str, Enum):
 
     VALIDATION_FAILURE = 'validation_failure'
     """Represents a validation failure for a function call."""
+
+    # OpenCode-style actions
+    GLOB = 'glob'
+    """Searches for files matching a glob pattern."""
+
+    GREP = 'grep'
+    """Searches file contents using a regex pattern."""
+
+    LIST_DIR = 'list_dir'
+    """Lists files and directories in a given path."""
+
+    OPENCODE_READ = 'opencode_read'
+    """Reads a file with OpenCode-style formatting (5-digit line numbers, binary detection, etc.)."""
+
+    OPENCODE_WRITE = 'opencode_write'
+    """Writes a file with LSP diagnostics after write."""
+
+    QUESTION = 'question'
+    """Asks the user structured questions."""
+
+    APPLY_PATCH = 'apply_patch'
+    """Applies a unified diff patch to files."""
+
+    TODO_READ = 'todo_read'
+    """Reads the current task/todo list."""
+
+    TODO_WRITE = 'todo_write'
+    """Creates or updates tasks in the todo list."""
+
+    # Codex-style actions
+    CODEX_READ_FILE = 'codex_read_file'
+    """Reads a file with 1-indexed line numbers, supporting slice and indentation-aware block modes."""
+
+    CODEX_LIST_DIR = 'codex_list_dir'
+    """Lists entries in a directory with 1-indexed entry numbers and type labels."""
+
+    CODEX_GREP_FILES = 'codex_grep_files'
+    """Finds files whose contents match a pattern, listed by modification time."""
+
+    CODEX_APPLY_PATCH = 'codex_apply_patch'
+    """Applies a Codex-format freeform patch to files."""
+
+    CODEX_UPDATE_PLAN = 'codex_update_plan'
+    """Updates the task plan with steps and statuses."""
+
+    # Terminus-2-style actions
+    TERMINUS_2_CMD_RUN = 'terminus_2_cmd_run'
+    """Sends raw keystrokes to a terminal session and captures the resulting screen state."""

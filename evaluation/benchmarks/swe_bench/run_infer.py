@@ -30,6 +30,9 @@ from evaluation.utils.shared import (
     assert_and_raise,
     check_maximum_retries_exceeded,
     codeact_user_response,
+    codex_user_response,
+    opencode_user_response,
+    terminus_2_user_response,
     get_default_sandbox_config_for_eval,
     get_metrics,
     get_openhands_config_for_eval,
@@ -104,6 +107,9 @@ def set_dataset_type(dataset_name: str) -> str:
 
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
     'CodeActAgent': codeact_user_response,
+    'OpenCodeAgent': opencode_user_response,
+    'CodexAgent': codex_user_response,
+    'Terminus2Agent': terminus_2_user_response,
 }
 
 
@@ -120,27 +126,37 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageActio
     mode = metadata.details['mode']
     llm_model = metadata.llm_config.model
 
-    # Determine the template file based on mode and LLM
-    if metadata.instruction_template_name:
-        template_name = metadata.instruction_template_name
-    elif mode.startswith('swt'):
-        template_name = 'swt.j2'
-    elif mode == 'swe':
-        if 'gpt-4.1' in llm_model:
-            template_name = 'swe_gpt4.j2'
-        else:
-            template_name = (
-                'swe_default.j2'  # Default for 'swe' mode (regular swe-bench)
-            )
+    # Check for custom instruction template path (absolute path takes precedence)
+    custom_instruction_template_path = metadata.details.get('instruction_template_path')
+
+    if custom_instruction_template_path and os.path.isfile(custom_instruction_template_path):
+        # Use custom instruction template from provided path
+        prompts_dir = os.path.dirname(custom_instruction_template_path)
+        template_name = os.path.basename(custom_instruction_template_path)
+        logger.info(f'Using custom instruction template: {custom_instruction_template_path}')
     else:
-        # Fallback or error handling if mode is unexpected
-        logger.error(f'Unexpected evaluation mode: {mode}. Falling back to default.')
-        template_name = 'swe_default.j2'
+        # Determine the template file based on mode and LLM
+        if metadata.instruction_template_name:
+            template_name = metadata.instruction_template_name
+        elif mode.startswith('swt'):
+            template_name = 'swt.j2'
+        elif mode == 'swe':
+            if 'gpt-4.1' in llm_model:
+                template_name = 'swe_gpt4.j2'
+            else:
+                template_name = (
+                    'swe_default.j2'  # Default for 'swe' mode (regular swe-bench)
+                )
+        else:
+            # Fallback or error handling if mode is unexpected
+            logger.error(f'Unexpected evaluation mode: {mode}. Falling back to default.')
+            template_name = 'swe_default.j2'
+
+        # Default prompts directory
+        prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
 
     logger.debug(f'Using instruction template file: {template_name}')
     # Set up Jinja2 environment
-    # Assuming templates are in 'evaluation/benchmarks/swe_bench/prompts' relative to this script
-    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
     env = Environment(loader=FileSystemLoader(prompts_dir))
     template = env.get_template(template_name)
 
@@ -214,6 +230,9 @@ def get_instance_docker_image(
         return (docker_image_prefix.rstrip('/') + '/' + image_name).lower()
 
 
+
+
+
 def get_config(
     instance: pd.Series,
     metadata: EvalMetadata,
@@ -273,6 +292,8 @@ def get_config(
         system_prompt_filename=metadata.agent_config.system_prompt_filename
         if metadata.agent_config
         else 'system_prompt.j2',
+        system_prompt_path=SYSTEM_PROMPT_PATH,
+        system_prompt_long_horizon_path=SYSTEM_PROMPT_LONG_HORIZON_PATH,
     )
     config.set_agent_config(agent_config)
 
@@ -867,6 +888,13 @@ def filter_dataset(
 
 
 if __name__ == '__main__':
+    # Declare globals at the start of the block
+    global SYSTEM_PROMPT_PATH, SYSTEM_PROMPT_LONG_HORIZON_PATH
+
+    # Module-level variables to store custom prompt paths
+    SYSTEM_PROMPT_PATH = None
+    SYSTEM_PROMPT_LONG_HORIZON_PATH = None
+
     parser = get_evaluation_parser()
     parser.add_argument(
         '--dataset',
@@ -898,6 +926,24 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help='Path to a JSON file containing instance data to use instead of loading from HuggingFace (e.g., \'{"instance_id": "...", "repo": "...", ...}\')',
+    )
+    parser.add_argument(
+        '--instruction-template-path',
+        type=str,
+        default=None,
+        help='Path to a custom instruction template file (overrides swe_default.j2)',
+    )
+    parser.add_argument(
+        '--system-prompt-path',
+        type=str,
+        default=None,
+        help='Path to a custom system_prompt.j2 file',
+    )
+    parser.add_argument(
+        '--system-prompt-long-horizon-path',
+        type=str,
+        default=None,
+        help='Path to a custom system_prompt_long_horizon.j2 file',
     )
 
     args, _ = parser.parse_known_args()
@@ -996,7 +1042,27 @@ if __name__ == '__main__':
     if args.agent_config:
         agent_config = get_agent_config_arg(args.agent_config, args.config_file)
 
+    # Set up custom system prompt paths if provided
+    if args.system_prompt_path:
+        if os.path.isfile(args.system_prompt_path):
+            SYSTEM_PROMPT_PATH = args.system_prompt_path
+            logger.info(f'Using custom system_prompt.j2: {SYSTEM_PROMPT_PATH}')
+        else:
+            raise ValueError(f'System prompt file does not exist: {args.system_prompt_path}')
+
+    if args.system_prompt_long_horizon_path:
+        if os.path.isfile(args.system_prompt_long_horizon_path):
+            SYSTEM_PROMPT_LONG_HORIZON_PATH = args.system_prompt_long_horizon_path
+            logger.info(f'Using custom system_prompt_long_horizon.j2: {SYSTEM_PROMPT_LONG_HORIZON_PATH}')
+        else:
+            raise ValueError(f'System prompt long horizon file does not exist: {args.system_prompt_long_horizon_path}')
+
+    # Build details dict with custom prompt paths
     details = {'mode': args.mode}
+    if args.instruction_template_path:
+        details['instruction_template_path'] = args.instruction_template_path
+        logger.info(f'Custom instruction template path: {args.instruction_template_path}')
+
     _agent_cls = openhands.agenthub.Agent.get_cls(args.agent_cls)
 
     dataset_description = (

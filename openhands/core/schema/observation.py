@@ -64,3 +64,42 @@ class ObservationType(str, Enum):
 
     VALIDATION_FAILURE = 'validation_failure'
     """Result of a validation failure for a function call"""
+
+    # OpenCode-style observations
+    GLOB = 'glob'
+    """Result of a glob file search operation."""
+
+    GREP = 'grep'
+    """Result of a grep content search operation."""
+
+    LIST_DIR = 'list_dir'
+    """Result of a directory listing operation."""
+
+    OPENCODE_READ = 'opencode_read'
+    """Result of an OpenCode-style file read operation."""
+
+    OPENCODE_WRITE = 'opencode_write'
+    """Result of an OpenCode-style file write operation with diagnostics."""
+
+    QUESTION = 'question'
+    """Result of asking the user a question."""
+
+    APPLY_PATCH = 'apply_patch'
+    """Result of applying a patch to files."""
+
+    TODO_READ = 'todo_read'
+    """Result of reading the current todo list."""
+
+    TODO_WRITE = 'todo_write'
+    """Result of updating the todo list."""
+
+    # Codex-style observations
+    CODEX_APPLY_PATCH = 'codex_apply_patch'
+    """Result of applying a Codex-format patch to files."""
+
+    CODEX_UPDATE_PLAN = 'codex_update_plan'
+    """Result of updating the task plan."""
+
+    # Terminus-2-style observations
+    TERMINUS_2_CMD_OUTPUT = 'terminus_2_cmd_output'
+    """Result of sending keystrokes to a terminal session, containing captured screen state."""

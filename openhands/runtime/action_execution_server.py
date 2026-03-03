@@ -17,6 +17,8 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from zipfile import ZipFile
+import glob as glob_module
+import subprocess
 
 import puremagic
 from binaryornot.check import is_binary
@@ -24,7 +26,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
-from openhands_aci.editor.editor import OHEditor
+# Use OpenCodeEditor with fuzzy matching instead of default OHEditor
+try:
+    from openhands.agenthub.opencode_agent.opencode_editor import OpenCodeEditor as OHEditor
+except ImportError:
+    # Fallback to standard OHEditor if OpenCodeEditor not available (e.g., in sandbox)
+    from openhands_aci.editor.editor import OHEditor
 from openhands_aci.editor.exceptions import ToolError
 from openhands_aci.editor.results import ToolResult
 from openhands_aci.utils.diff import get_diff
@@ -39,14 +46,31 @@ from openhands.core.logger import get_uvicorn_json_log_config
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
     Action,
+    ApplyPatchAction,
     BrowseInteractiveAction,
     BrowseURLAction,
     CmdRunAction,
     FileEditAction,
     FileReadAction,
     FileWriteAction,
+    GlobAction,
+    GrepAction,
     IPythonRunCellAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
 )
+from openhands.events.action.codex import (
+    CodexApplyPatchAction,
+    CodexGrepFilesAction,
+    CodexListDirAction,
+    CodexReadFileAction,
+    CodexUpdatePlanAction,
+)
+from openhands.events.action.terminus_2 import Terminus2CmdRunAction
 from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
     CmdOutputObservation,
@@ -57,7 +81,18 @@ from openhands.events.observation import (
     FileWriteObservation,
     IPythonRunCellObservation,
     Observation,
+    TodoReadObservation,
+    TodoWriteObservation,
 )
+from openhands.events.observation.opencode import (
+    ApplyPatchObservation,
+    QuestionObservation,
+)
+from openhands.events.observation.codex import (
+    CodexApplyPatchObservation,
+    CodexUpdatePlanObservation,
+)
+from openhands.events.observation.terminus_2 import Terminus2CmdOutputObservation
 from openhands.events.serialization import event_from_dict, event_to_dict
 from openhands.runtime.browser import browse
 from openhands.runtime.browser.browser_env import BrowserEnv
@@ -206,6 +241,7 @@ class ActionExecutor:
         self._initialized = False
         self.downloaded_files: list[str] = []
         self.downloads_directory = '/workspace/.downloads'
+        self._todos: list[dict] = []  # In-memory todo list storage
 
         self.max_memory_gb: int | None = None
         if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', None):
@@ -587,6 +623,1704 @@ class ActionExecutor:
                 filepath=action.path,
             ),
         )
+
+    # =========================================================================
+    # OpenCode-style action handlers
+    # =========================================================================
+
+    async def opencode_read(self, action: OpenCodeReadAction) -> Observation:
+        """Execute OpenCode-style file read with 5-digit line numbers."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.path, working_dir)
+
+        # Constants matching OpenCode behavior
+        MAX_BYTES = 50 * 1024  # 50KB
+        MAX_LINE_LENGTH = 2000
+        BINARY_EXTENSIONS = {
+            '.zip', '.tar', '.gz', '.exe', '.dll', '.so', '.class', '.jar',
+            '.war', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            '.bin', '.dat', '.obj', '.o', '.a', '.lib', '.wasm', '.pyc', '.pyo'
+        }
+
+        # Check if file exists
+        if not os.path.exists(filepath):
+            # Try to find suggestions
+            directory = os.path.dirname(filepath) or '.'
+            basename = os.path.basename(filepath)
+
+            if os.path.isdir(directory):
+                try:
+                    entries = os.listdir(directory)
+                    suggestions = [
+                        os.path.join(directory, entry)
+                        for entry in entries
+                        if basename.lower() in entry.lower() or entry.lower() in basename.lower()
+                    ][:3]
+
+                    if suggestions:
+                        return ErrorObservation(
+                            f"File not found: {filepath}\n\nDid you mean one of these?\n"
+                            + "\n".join(suggestions)
+                        )
+                except OSError:
+                    pass
+
+            return ErrorObservation(f"File not found: {filepath}")
+
+        # Check if directory
+        if os.path.isdir(filepath):
+            return ErrorObservation(f"Path is a directory: {filepath}. You can only read files")
+
+        # Check binary by extension
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in BINARY_EXTENSIONS:
+            return ErrorObservation(f"Cannot read binary file: {filepath}")
+
+        # Check binary by content
+        try:
+            with open(filepath, 'rb') as f:
+                chunk = f.read(4096)
+                if b'\x00' in chunk:
+                    return ErrorObservation(f"Cannot read binary file: {filepath}")
+                if chunk:
+                    non_printable = sum(1 for b in chunk if b < 9 or (b > 13 and b < 32))
+                    if non_printable / len(chunk) > 0.3:
+                        return ErrorObservation(f"Cannot read binary file: {filepath}")
+        except Exception:
+            pass
+
+        # Read file
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.read().split('\n')
+        except Exception as e:
+            return ErrorObservation(f"Error reading file: {e}")
+
+        # Process lines with offset and limit
+        offset = action.offset
+        limit = action.limit
+        raw = []
+        total_bytes = 0
+        truncated_by_bytes = False
+
+        for i in range(offset, min(len(lines), offset + limit)):
+            line = lines[i]
+            if len(line) > MAX_LINE_LENGTH:
+                line = line[:MAX_LINE_LENGTH] + "..."
+
+            line_bytes = len(line.encode('utf-8')) + (1 if raw else 0)
+            if total_bytes + line_bytes > MAX_BYTES:
+                truncated_by_bytes = True
+                break
+
+            raw.append(line)
+            total_bytes += line_bytes
+
+        # Format with 5-digit line numbers and | separator (OpenCode style)
+        content_lines = [
+            f"{str(i + offset + 1).zfill(5)}| {line}"
+            for i, line in enumerate(raw)
+        ]
+
+        total_lines = len(lines)
+        last_read_line = offset + len(raw)
+        has_more_lines = total_lines > last_read_line
+        truncated = has_more_lines or truncated_by_bytes
+
+        output = "<file>\n"
+        output += "\n".join(content_lines)
+
+        if truncated_by_bytes:
+            output += f"\n\n(Output truncated at {MAX_BYTES} bytes. Use 'offset' parameter to read beyond line {last_read_line})"
+        elif has_more_lines:
+            output += f"\n\n(File has more lines. Use 'offset' parameter to read beyond line {last_read_line})"
+        else:
+            output += f"\n\n(End of file - total {total_lines} lines)"
+
+        output += "\n</file>"
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"opencode_read {filepath}",
+        )
+
+    async def opencode_write(self, action: OpenCodeWriteAction) -> Observation:
+        """Execute OpenCode-style file write with LSP diagnostics."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.path, working_dir)
+
+        # Create directory if needed
+        directory = os.path.dirname(filepath)
+        if directory and not os.path.exists(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError as e:
+                return ErrorObservation(f"Failed to create directory: {e}")
+
+        # Write file
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(action.content)
+        except Exception as e:
+            return ErrorObservation(f"Failed to write file: {e}")
+
+        output = "Wrote file successfully."
+
+        # Run linter based on file extension
+        ext = os.path.splitext(filepath)[1].lower()
+        errors = []
+
+        try:
+            import subprocess
+
+            if ext == '.py':
+                # Try flake8, pylint, py_compile in order
+                for linter_cmd in [
+                    ['flake8', '--max-line-length=120', filepath],
+                    ['pylint', '--errors-only', filepath],
+                    ['python3', '-m', 'py_compile', filepath],
+                ]:
+                    try:
+                        result = subprocess.run(
+                            linter_cmd, capture_output=True, text=True, timeout=10
+                        )
+                        lint_output = result.stdout.strip() or result.stderr.strip()
+                        if lint_output:
+                            errors.extend(lint_output.split('\n')[:20])
+                            break
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+
+            elif ext in ('.js', '.jsx', '.ts', '.tsx'):
+                try:
+                    result = subprocess.run(
+                        ['eslint', '--format=compact', filepath],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result.stdout.strip():
+                        errors.extend(result.stdout.strip().split('\n')[:20])
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+            elif ext == '.go':
+                try:
+                    result = subprocess.run(
+                        ['go', 'vet', filepath],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result.stderr.strip():
+                        errors.extend(result.stderr.strip().split('\n')[:20])
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+            elif ext == '.rs':
+                try:
+                    result = subprocess.run(
+                        ['cargo', 'check', '--message-format=short'],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.stderr.strip():
+                        error_lines = [
+                            l for l in result.stderr.strip().split('\n')
+                            if 'error' in l.lower()
+                        ][:20]
+                        errors.extend(error_lines)
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+        except Exception:
+            pass
+
+        if errors:
+            output += f'\n\nLSP errors detected in this file, please fix:\n'
+            output += f'<diagnostics file="{filepath}">\n'
+            output += '\n'.join(errors)
+            output += '\n</diagnostics>'
+
+        return FileWriteObservation(content=output, path=filepath)
+
+    async def glob(self, action: GlobAction) -> Observation:
+        """Execute glob file search using ripgrep or Python glob."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        search_path = self._resolve_path(action.path, working_dir)
+
+        # Validate path exists
+        if not os.path.exists(search_path):
+            return ErrorObservation(
+                f"Path does not exist: {search_path}"
+            )
+
+        # Auto-prepend **/ to patterns without a path separator so that
+        # simple patterns like "*.py" search recursively instead of only
+        # matching at the root of the search path.
+        pattern = action.pattern
+        if '/' not in pattern:
+            pattern = '**/' + pattern
+
+        files = []
+        truncated = False
+        limit = 100
+        rg_available = False
+
+        # Try ripgrep first (fast, respects .gitignore)
+        # Note: avoid --sortr flag as it requires ripgrep >= 13.0.0
+        try:
+            result = subprocess.run(
+                ['rg', '--files', '-g', pattern, search_path],
+                capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            rg_available = True
+
+            if result.returncode == 0 and result.stdout.strip():
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+            elif result.returncode == 1:
+                # Exit code 1 = no matches found (not an error)
+                files = []
+            elif result.returncode not in (0, 1):
+                logger.warning(f"rg --files failed: {result.stderr.strip()}")
+                rg_available = False
+        except FileNotFoundError:
+            rg_available = False
+        except subprocess.TimeoutExpired:
+            return ErrorObservation("glob search timed out after 30 seconds")
+
+        # Fallback to Python's glob module (handles ** patterns natively)
+        if not rg_available:
+            try:
+                full_pattern = os.path.join(search_path, pattern)
+                files = [
+                    f for f in glob_module.glob(full_pattern, recursive=True)
+                    if os.path.isfile(f)
+                ]
+            except Exception:
+                pass
+
+        # Sort by modification time (newest first)
+        try:
+            files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+        except (OSError, ValueError):
+            pass
+
+        # Apply limit
+        if len(files) > limit:
+            truncated = True
+            files = files[:limit]
+
+        # Build output
+        if not files:
+            output = "No files found"
+        else:
+            output = '\n'.join(files)
+            if truncated:
+                output += '\n\n(Results are truncated. Consider using a more specific path or pattern.)'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"glob {action.pattern} {action.path}",
+        )
+
+    async def grep(self, action: GrepAction) -> Observation:
+        """Execute grep content search using ripgrep or grep.
+
+        Results are sorted by file modification time (newest first) and limited
+        to 100 matches.  Uses ripgrep when available (respects .gitignore) with
+        a fallback to grep -E for extended regex support (e.g. | alternation).
+        """
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        search_path = self._resolve_path(action.path, working_dir)
+
+        import shlex
+        import subprocess
+
+        # Validate path exists
+        if not os.path.exists(search_path):
+            return ErrorObservation(
+                f"Path does not exist: {search_path}"
+            )
+
+        raw_lines: list[str] = []
+        limit = 100
+        rg_available = False
+
+        # Ensure include pattern matches recursively (e.g., "*.py" -> "**/*.py")
+        include = action.include
+        if include and not include.startswith('**/'):
+            include = '**/' + include
+
+        # Try ripgrep first (respects .gitignore)
+        try:
+            cmd = ['rg', '-n', '--regexp', action.pattern, search_path]
+            if include:
+                cmd = ['rg', '-n', '--regexp', action.pattern, '-g', include, search_path]
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            rg_available = True
+
+            if result.returncode == 0 and result.stdout.strip():
+                raw_lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
+            elif result.returncode == 1:
+                # Exit code 1 = no matches found (not an error)
+                raw_lines = []
+            elif result.returncode == 2:
+                # Exit code 2 = regex syntax error (e.g. unmatched parenthesis)
+                stderr = result.stderr.strip()
+                return ErrorObservation(
+                    f"Invalid regex pattern: {action.pattern!r}. "
+                    f"The pattern is treated as a regex. Characters like (, ), [, ], "
+                    f"{{, }}, ., *, +, ? have special meaning and must be escaped "
+                    f"with a backslash (e.g. 'write_records\\(' instead of 'write_records('). "
+                    f"Detail: {stderr}"
+                )
+            elif result.returncode not in (0, 1):
+                stderr = result.stderr.strip()
+                logger.warning(f"rg failed: {stderr}")
+                rg_available = False
+        except FileNotFoundError:
+            rg_available = False
+        except subprocess.TimeoutExpired:
+            return ErrorObservation("grep search timed out after 30 seconds")
+
+        # Fallback to grep if rg is not available
+        if not rg_available:
+            try:
+                if include:
+                    # Strip **/ prefix for grep --include (doesn't understand **/*)
+                    grep_include = include
+                    if grep_include.startswith('**/'):
+                        grep_include = grep_include[3:]
+                    include_flag = f'--include={shlex.quote(grep_include)} '
+                else:
+                    include_flag = ''
+
+                cmd_str = (
+                    f'grep -rHn {include_flag}'
+                    f'-E {shlex.quote(action.pattern)} {shlex.quote(search_path)}'
+                )
+                result = subprocess.run(
+                    cmd_str,
+                    shell=True, capture_output=True, text=True, timeout=30, cwd=working_dir
+                )
+
+                if result.returncode == 2:
+                    # Exit code 2 = regex syntax error
+                    return ErrorObservation(
+                        f"Invalid regex pattern: {action.pattern!r}. "
+                        f"The pattern is treated as a regex. Characters like (, ), [, ], "
+                        f"{{, }}, ., *, +, ? have special meaning and must be escaped "
+                        f"with a backslash (e.g. 'write_records\\(' instead of 'write_records('). "
+                        f"Alternatively, remov the sepecial characters from the pattern."
+                    )
+
+                if result.stdout.strip():
+                    raw_lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
+            except subprocess.TimeoutExpired:
+                return ErrorObservation("grep search timed out after 30 seconds")
+            except Exception as e:
+                logger.warning(f"grep fallback failed: {e}")
+
+        if not raw_lines:
+            output = "No matches found"
+        else:
+            # Sort results by file modification time (newest first).
+            # Each line has the format  filepath:linenum:content
+            def _mtime_key(line: str) -> float:
+                filepath = line.split(':')[0]
+                try:
+                    return os.path.getmtime(filepath)
+                except OSError:
+                    return 0.0
+
+            raw_lines.sort(key=_mtime_key, reverse=True)
+
+            # Apply limit
+            if len(raw_lines) > limit:
+                output = '\n'.join(raw_lines[:limit])
+                output += f'\n\n(Results truncated, showing {limit} of {len(raw_lines)}+ matches)'
+            else:
+                output = '\n'.join(raw_lines)
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"grep {action.pattern} {action.path}",
+        )
+
+    async def list_dir(self, action: ListDirAction) -> Observation:
+        """Execute directory listing with tree structure."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        list_path = self._resolve_path(action.path, working_dir)
+
+        import subprocess
+
+        # Combine default and custom ignore patterns
+        all_ignores = action.all_ignores
+
+        files = []
+        limit = 100
+
+        # Try ripgrep first (respects .gitignore)
+        try:
+            cmd = ['rg', '--files']
+            for pattern in all_ignores:
+                cmd.extend(['-g', f'!{pattern}/**'])
+            if list_path != '.':
+                cmd.append(list_path)
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()][:limit]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Build tree structure if we have files
+        if files:
+            dirs = set()
+            files_by_dir = {}
+
+            for f in files:
+                d = os.path.dirname(f) or '.'
+                parts = d.split(os.sep) if d != '.' else []
+
+                # Add all parent directories
+                for i in range(len(parts) + 1):
+                    dir_p = os.sep.join(parts[:i]) if i > 0 else '.'
+                    dirs.add(dir_p)
+
+                # Add file to its directory
+                if d not in files_by_dir:
+                    files_by_dir[d] = []
+                files_by_dir[d].append(os.path.basename(f))
+
+            def render_dir(dir_path: str, depth: int) -> str:
+                output = ''
+                if depth > 0:
+                    output += '  ' * depth + os.path.basename(dir_path) + '/\n'
+
+                # Get child directories
+                children = sorted([
+                    d for d in dirs
+                    if os.path.dirname(d) == dir_path and d != dir_path
+                ])
+
+                # Render subdirectories first
+                for child in children:
+                    output += render_dir(child, depth + 1)
+
+                # Render files
+                for f in sorted(files_by_dir.get(dir_path, [])):
+                    output += '  ' * (depth + 1) + f + '\n'
+
+                return output
+
+            abs_path = os.path.abspath(list_path)
+            output = f"{abs_path}/\n" + render_dir('.', 0)
+        else:
+            # Fallback to tree or find
+            try:
+                # Try tree command
+                ignore_args = []
+                for p in all_ignores:
+                    ignore_args.extend(['-I', p])
+
+                result = subprocess.run(
+                    ['tree', '-L', '3', '--noreport'] + ignore_args + [list_path],
+                    capture_output=True, text=True, timeout=10, cwd=working_dir
+                )
+                output = result.stdout.strip()
+            except FileNotFoundError:
+                # Fallback to find
+                try:
+                    result = subprocess.run(
+                        ['find', list_path, '-maxdepth', '3', '-type', 'f'],
+                        capture_output=True, text=True, timeout=10, cwd=working_dir
+                    )
+                    lines = result.stdout.strip().split('\n')
+                    # Filter out ignored patterns
+                    filtered = [
+                        l for l in lines
+                        if l and not any(p in l for p in all_ignores)
+                    ][:limit]
+                    output = '\n'.join(filtered) if filtered else 'No files found'
+                except Exception:
+                    output = 'No files found'
+            except subprocess.TimeoutExpired:
+                output = 'Directory listing timed out'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"list_dir {action.path}",
+        )
+
+    async def question(self, action: QuestionAction) -> Observation:
+        """Handle a question action. Returns an observation with the questions.
+
+        Note: In a full implementation, this would interact with the user.
+        In sandbox/evaluation mode, we return the questions as-is since
+        the controller handles user interaction.
+        """
+        return QuestionObservation(
+            content=json.dumps(action.questions, indent=2),
+            questions=action.questions,
+        )
+
+    async def apply_patch(self, action: ApplyPatchAction) -> Observation:
+        """Apply a unified diff patch to files."""
+        assert self.bash_session is not None
+        try:
+            # Write the patch to a temporary file and apply with git apply
+            import tempfile
+            patch_text = action.patchText
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.patch', delete=False
+            ) as f:
+                f.write(patch_text)
+                patch_file = f.name
+
+            try:
+                result = subprocess.run(
+                    ['git', 'apply', '--verbose', patch_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=self.bash_session.cwd,
+                )
+                if result.returncode == 0:
+                    output = result.stdout.strip() or 'Patch applied successfully.'
+                    # Try to extract changed files from verbose output
+                    files_changed = [
+                        line.split(':')[0].strip()
+                        for line in result.stderr.strip().split('\n')
+                        if line.strip()
+                    ]
+                    return ApplyPatchObservation(
+                        content=output,
+                        files_changed=files_changed,
+                        success=True,
+                    )
+                else:
+                    error_msg = result.stderr.strip() or result.stdout.strip()
+                    return ApplyPatchObservation(
+                        content=f'Failed to apply patch: {error_msg}',
+                        success=False,
+                    )
+            finally:
+                os.unlink(patch_file)
+        except Exception as e:
+            logger.exception(f'Error applying patch: {e}')
+            return ErrorObservation(f'Failed to apply patch: {str(e)}')
+
+    async def todo_read(self, action: TodoReadAction) -> Observation:
+        """Read the current todo list."""
+        return TodoReadObservation(
+            content=json.dumps(self._todos, indent=2) if self._todos else '[]',
+            todos=list(self._todos),
+        )
+
+    async def todo_write(self, action: TodoWriteAction) -> Observation:
+        """Update the todo list with new or modified items."""
+        try:
+            incoming_todos = action.todos
+            if not isinstance(incoming_todos, list):
+                return ErrorObservation('todos must be a list of todo objects')
+
+            # Build index of existing todos by id
+            existing_by_id = {t['id']: t for t in self._todos if 'id' in t}
+
+            # Merge incoming todos: update existing by id, add new ones
+            for todo in incoming_todos:
+                if not isinstance(todo, dict):
+                    continue
+                todo_id = todo.get('id')
+                if todo_id and todo_id in existing_by_id:
+                    # Update existing todo
+                    existing_by_id[todo_id].update(todo)
+                else:
+                    # Add new todo
+                    self._todos.append(todo)
+                    if todo_id:
+                        existing_by_id[todo_id] = todo
+
+            return TodoWriteObservation(
+                content=json.dumps(self._todos, indent=2),
+                todos=list(self._todos),
+                success=True,
+            )
+        except Exception as e:
+            logger.exception(f'Error updating todos: {e}')
+            return ErrorObservation(f'Failed to update todos: {str(e)}')
+
+    # =========================================================================
+    # Codex-style action handlers
+    # =========================================================================
+
+    async def codex_read_file(self, action: CodexReadFileAction) -> Observation:
+        """Execute Codex-style file read with L{number}: format and 1-indexed lines."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.file_path, working_dir)
+
+        # Check if file exists
+        if not os.path.exists(filepath):
+            # Try to find suggestions
+            directory = os.path.dirname(filepath) or '.'
+            basename = os.path.basename(filepath)
+
+            if os.path.isdir(directory):
+                try:
+                    entries = os.listdir(directory)
+                    suggestions = [
+                        os.path.join(directory, entry)
+                        for entry in entries
+                        if basename.lower() in entry.lower() or entry.lower() in basename.lower()
+                    ][:3]
+
+                    if suggestions:
+                        return ErrorObservation(
+                            f"File not found: {filepath}\n\nDid you mean one of these?\n"
+                            + "\n".join(suggestions)
+                        )
+                except OSError:
+                    pass
+
+            return ErrorObservation(f"File not found: {filepath}")
+
+        # Check if directory
+        if os.path.isdir(filepath):
+            return ErrorObservation(f"Path is a directory: {filepath}. You can only read files")
+
+        # Check binary by content
+        try:
+            with open(filepath, 'rb') as f:
+                chunk = f.read(4096)
+                if b'\x00' in chunk:
+                    return ErrorObservation(f"Cannot read binary file: {filepath}")
+                if chunk:
+                    non_printable = sum(1 for b in chunk if b < 9 or (b > 13 and b < 32))
+                    if non_printable / len(chunk) > 0.3:
+                        return ErrorObservation(f"Cannot read binary file: {filepath}")
+        except Exception:
+            pass
+
+        # Read file
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.read().split('\n')
+        except Exception as e:
+            return ErrorObservation(f"Error reading file: {e}")
+
+        total_lines = len(lines)
+
+        # Handle indentation mode
+        if action.mode == 'indentation' and action.indentation:
+            return self._codex_read_file_indentation(
+                lines, total_lines, filepath, action
+            )
+
+        # Slice mode (default) - 1-indexed offset
+        offset = max(action.offset, 1)  # Ensure >= 1
+        limit = action.limit
+        start_idx = offset - 1  # Convert to 0-indexed
+
+        raw = []
+        for i in range(start_idx, min(total_lines, start_idx + limit)):
+            raw.append(lines[i])
+
+        # Format with L{number}: (Codex style, 1-indexed)
+        content_lines = [
+            f"L{i + offset}: {line}"
+            for i, line in enumerate(raw)
+        ]
+
+        last_read_line = offset + len(raw) - 1
+        has_more = total_lines > (start_idx + len(raw))
+
+        output = '\n'.join(content_lines)
+        if has_more:
+            output += f'\n\n(File has {total_lines} lines total. Use offset to read more.)'
+        else:
+            output += f'\n\n(End of file. Total lines: {total_lines})'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"codex_read_file {filepath}",
+        )
+
+    def _codex_read_file_indentation(
+        self, lines: list[str], total_lines: int, filepath: str,
+        action: CodexReadFileAction,
+    ) -> Observation:
+        """Handle indentation-aware block reading mode."""
+        indent_args = action.indentation
+        anchor = indent_args.get('anchor_line', action.offset)
+        anchor_idx = max(anchor - 1, 0)  # Convert to 0-indexed
+        max_levels = indent_args.get('max_levels', 0)
+        include_siblings = indent_args.get('include_siblings', False)
+        include_header = indent_args.get('include_header', True)
+        max_lines = indent_args.get('max_lines', action.limit)
+
+        if anchor_idx >= total_lines:
+            return ErrorObservation(
+                f"Anchor line {anchor} is beyond end of file ({total_lines} lines)"
+            )
+
+        # Get the indentation level of the anchor line
+        anchor_line = lines[anchor_idx]
+        anchor_indent = len(anchor_line) - len(anchor_line.lstrip())
+
+        # Find the block boundaries
+        # Walk upward to find parent blocks based on max_levels
+        start_idx = anchor_idx
+        current_indent = anchor_indent
+        levels_found = 0
+
+        for i in range(anchor_idx - 1, -1, -1):
+            line = lines[i]
+            stripped = line.lstrip()
+            if not stripped:  # Skip empty lines
+                continue
+            line_indent = len(line) - len(stripped)
+            if line_indent < current_indent:
+                levels_found += 1
+                current_indent = line_indent
+                start_idx = i
+                if max_levels > 0 and levels_found >= max_levels:
+                    break
+
+        # Include header (doc comments/attributes above the block)
+        if include_header and start_idx > 0:
+            for i in range(start_idx - 1, -1, -1):
+                line = lines[i].strip()
+                if line.startswith('#') or line.startswith('//') or line.startswith('/*') or \
+                   line.startswith('*') or line.startswith('"""') or line.startswith("'''") or \
+                   line.startswith('@') or not line:
+                    start_idx = i
+                else:
+                    break
+
+        # Walk downward to find end of block
+        end_idx = anchor_idx
+        for i in range(anchor_idx + 1, total_lines):
+            line = lines[i]
+            stripped = line.lstrip()
+            if not stripped:  # Include empty lines within block
+                end_idx = i
+                continue
+            line_indent = len(line) - len(stripped)
+            if line_indent <= anchor_indent and stripped:
+                if include_siblings and line_indent == anchor_indent:
+                    end_idx = i
+                    continue
+                break
+            end_idx = i
+
+        # Apply max_lines cap
+        if max_lines and (end_idx - start_idx + 1) > max_lines:
+            end_idx = start_idx + max_lines - 1
+
+        # Collect lines
+        raw = lines[start_idx:end_idx + 1]
+
+        # Format with L{number}: (1-indexed)
+        content_lines = [
+            f"L{start_idx + 1 + i}: {line}"
+            for i, line in enumerate(raw)
+        ]
+
+        output = '\n'.join(content_lines)
+        output += f'\n\n(Showing lines {start_idx + 1}-{end_idx + 1} of {total_lines} total)'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"codex_read_file {filepath} (indentation mode)",
+        )
+
+    async def codex_list_dir(self, action: CodexListDirAction) -> Observation:
+        """Execute Codex-style directory listing with numbered entries and type labels."""
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        dir_path = self._resolve_path(action.dir_path, working_dir)
+
+        if not os.path.exists(dir_path):
+            return ErrorObservation(f"Directory not found: {dir_path}")
+
+        if not os.path.isdir(dir_path):
+            return ErrorObservation(f"Path is not a directory: {dir_path}")
+
+        # Collect entries recursively up to depth
+        entries: list[tuple[str, str]] = []  # (relative_path, type_label)
+
+        def _collect_entries(current_path: str, rel_prefix: str, current_depth: int) -> None:
+            if current_depth > action.depth:
+                return
+            try:
+                items = sorted(os.listdir(current_path))
+            except PermissionError:
+                return
+
+            for item in items:
+                # Skip hidden files and common ignore patterns
+                if item.startswith('.'):
+                    continue
+
+                full_path = os.path.join(current_path, item)
+                rel_path = os.path.join(rel_prefix, item) if rel_prefix else item
+
+                if os.path.isdir(full_path):
+                    entries.append((rel_path, 'dir'))
+                    if current_depth < action.depth:
+                        _collect_entries(full_path, rel_path, current_depth + 1)
+                else:
+                    entries.append((rel_path, 'file'))
+
+        _collect_entries(dir_path, '', 1)
+
+        # Apply offset and limit (1-indexed offset)
+        offset = max(action.offset, 1)
+        start_idx = offset - 1
+        end_idx = start_idx + action.limit
+
+        paginated = entries[start_idx:end_idx]
+
+        if not paginated:
+            output = "No entries found."
+        else:
+            # Format as numbered entries with type labels
+            output_lines = []
+            for i, (rel_path, type_label) in enumerate(paginated):
+                entry_num = start_idx + i + 1
+                output_lines.append(f"{entry_num}. [{type_label}] {rel_path}")
+            output = '\n'.join(output_lines)
+
+            if end_idx < len(entries):
+                output += f'\n\n(Showing {len(paginated)} of {len(entries)} entries. Use offset to see more.)'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"codex_list_dir {dir_path}",
+        )
+
+    async def codex_grep_files(self, action: CodexGrepFilesAction) -> Observation:
+        """Execute Codex-style grep: find files matching pattern, return paths sorted by mtime.
+
+        Matches the original Codex implementation: uses ripgrep with --sortr=modified,
+        --files-with-matches, --regexp, and --no-messages flags. Falls back to grep
+        if ripgrep is not available.
+        """
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        search_path = self._resolve_path(action.path, working_dir) if action.path else working_dir
+
+        import shlex
+        import subprocess
+
+        pattern = action.pattern.strip()
+        if not pattern:
+            return ErrorObservation("pattern must not be empty")
+
+        limit = min(action.limit, 2000) if action.limit > 0 else 100
+
+        # Normalize include glob: ensure it matches recursively
+        include = (action.include or '').strip() or None
+        if include and not include.startswith('**/'):
+            include = '**/' + include
+
+        # Verify path exists
+        if not os.path.exists(search_path):
+            return ErrorObservation(f"unable to access `{search_path}`: path does not exist")
+
+        files: list[str] = []
+        rg_available = False
+
+        # Try ripgrep first (matches Codex's Rust implementation exactly)
+        try:
+            cmd = ['rg', '--files-with-matches', '--sortr=modified', '--regexp', pattern, '--no-messages']
+            if include:
+                cmd.extend(['--glob', include])
+            cmd.extend(['--', search_path])
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            rg_available = True
+
+            if result.returncode == 0 and result.stdout.strip():
+                # rg found matches and already sorted by mtime
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+            elif result.returncode == 1:
+                # Exit code 1 = no matches (not an error)
+                files = []
+            elif result.returncode == 2:
+                # Exit code 2 = regex syntax error (e.g. unmatched parenthesis)
+                stderr = result.stderr.strip()
+                return ErrorObservation(
+                    f"Invalid regex pattern: {pattern!r}. "
+                    f"The pattern is treated as a regex. Characters like (, ), [, ], "
+                    f"{{, }}, ., *, +, ? have special meaning and must be escaped "
+                    f"with a backslash (e.g. 'write_records\\(' instead of 'write_records('). "
+                    f"Detail: {stderr}"
+                )
+            elif result.returncode not in (0, 1):
+                # rg failed with a non-regex error
+                stderr = result.stderr.strip()
+                logger.warning(f"rg failed: {stderr}")
+                # Fall through to grep fallback
+                rg_available = False
+
+        except FileNotFoundError:
+            # rg not installed
+            rg_available = False
+        except subprocess.TimeoutExpired:
+            return ErrorObservation("grep_files timed out after 30 seconds")
+
+        # Fallback to grep if rg is not available
+        if not rg_available:
+            try:
+                if include:
+                    # Convert glob pattern to find-compatible: "**/*.py" -> "*.py"
+                    find_pattern = include
+                    if find_pattern.startswith('**/'):
+                        find_pattern = find_pattern[3:]
+                    include_flag = f'--include={shlex.quote(find_pattern)} '
+                else:
+                    include_flag = ''
+
+                cmd_str = (
+                    f'grep -rl {include_flag}'
+                    f'-E {shlex.quote(pattern)} {shlex.quote(search_path)}'
+                )
+                result = subprocess.run(
+                    cmd_str, shell=True, capture_output=True, text=True, timeout=30, cwd=working_dir
+                )
+
+                if result.returncode == 2:
+                    # Exit code 2 = regex syntax error
+                    return ErrorObservation(
+                        f"Invalid regex pattern: {pattern!r}. "
+                        f"The pattern is treated as a regex. Characters like (, ), [, ], "
+                        f"{{, }}, ., *, +, ? have special meaning and must be escaped "
+                        f"with a backslash (e.g. 'write_records\\(' instead of 'write_records('). "
+                        f"Alternatively, remove the special characters from the pattern."
+                    )
+
+                if result.stdout.strip():
+                    files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+
+                # Sort by modification time (newest first) since grep doesn't sort
+                try:
+                    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+                except (OSError, ValueError):
+                    pass
+
+            except subprocess.TimeoutExpired:
+                return ErrorObservation("grep_files timed out after 30 seconds")
+            except Exception as e:
+                return ErrorObservation(f"grep_files failed: {str(e)}")
+
+        if not files:
+            return CmdOutputObservation(
+                content="No matches found.",
+                command_id=-1,
+                command=f"codex_grep_files {pattern}",
+            )
+
+        # Apply limit (rg results are already sorted by mtime)
+        truncated = len(files) > limit
+        if truncated:
+            files = files[:limit]
+
+        output = '\n'.join(files)
+        if truncated:
+            output += f'\n\n(Results truncated at {limit} files.)'
+
+        return CmdOutputObservation(
+            content=output,
+            command_id=-1,
+            command=f"codex_grep_files {pattern}",
+        )
+
+    async def codex_apply_patch(self, action: CodexApplyPatchAction) -> Observation:
+        """Apply a Codex freeform-format patch to files.
+
+        The Codex patch format uses:
+        *** Begin Patch / *** End Patch delimiters
+        *** Add File: <path>    - create new files
+        *** Delete File: <path> - delete files
+        *** Update File: <path> - modify existing files
+        *** Move to: <path>     - rename/move files (after Update File)
+        @@ <context>            - context anchors within Update File chunks
+        +/- lines for additions/removals
+        space-prefixed context lines (both old and new)
+        *** End of File         - mark end-of-file position
+        """
+        assert self.bash_session is not None
+        patch_text = action.patch
+
+        if not patch_text.strip():
+            return ErrorObservation('Empty patch provided.')
+
+        try:
+            hunks = self._codex_parse_patch(patch_text)
+        except ValueError as e:
+            return CodexApplyPatchObservation(
+                content=f'Patch parse error: {e}',
+                files_changed=[],
+                success=False,
+            )
+
+        if not hunks:
+            return CodexApplyPatchObservation(
+                content='Patch parsed but contained no file operations.',
+                files_changed=[],
+                success=False,
+            )
+
+        added: list[str] = []
+        modified: list[str] = []
+        deleted: list[str] = []
+        errors: list[str] = []
+
+        for hunk in hunks:
+            hunk_type = hunk['type']
+            path = hunk['path']
+            full_path = os.path.join(self.bash_session.cwd, path)
+
+            try:
+                if hunk_type == 'add':
+                    parent = os.path.dirname(full_path)
+                    if parent and not os.path.exists(parent):
+                        os.makedirs(parent, exist_ok=True)
+                    with open(full_path, 'w', encoding='utf-8') as f:
+                        f.write(hunk['contents'])
+                    added.append(path)
+
+                elif hunk_type == 'delete':
+                    if not os.path.exists(full_path):
+                        errors.append(
+                            f"Delete failed: file not found '{path}'"
+                        )
+                        continue
+                    os.unlink(full_path)
+                    deleted.append(path)
+
+                elif hunk_type == 'update':
+                    if not os.path.exists(full_path):
+                        errors.append(
+                            f"Update failed: file not found '{path}'"
+                        )
+                        continue
+                    if not os.path.isfile(full_path):
+                        errors.append(
+                            f"Update failed: '{path}' is not a regular file"
+                        )
+                        continue
+
+                    err = self._codex_apply_update_hunk(
+                        full_path, hunk['chunks']
+                    )
+                    if err:
+                        errors.append(f"Update failed for '{path}': {err}")
+                        continue
+
+                    move_path = hunk.get('move_path')
+                    if move_path:
+                        dest = os.path.join(self.bash_session.cwd, move_path)
+                        parent = os.path.dirname(dest)
+                        if parent and not os.path.exists(parent):
+                            os.makedirs(parent, exist_ok=True)
+                        os.rename(full_path, dest)
+                        modified.append(move_path)
+                    else:
+                        modified.append(path)
+
+            except Exception as e:
+                errors.append(f"Error processing '{path}': {e}")
+
+        files_changed = added + modified + deleted
+
+        if errors:
+            summary_parts = []
+            if files_changed:
+                summary_parts.append(
+                    f'Partial success ({len(files_changed)} file(s) changed):'
+                )
+                for p in added:
+                    summary_parts.append(f'  A {p}')
+                for p in modified:
+                    summary_parts.append(f'  M {p}')
+                for p in deleted:
+                    summary_parts.append(f'  D {p}')
+            summary_parts.append(
+                f'Errors ({len(errors)}):'
+            )
+            for err in errors:
+                summary_parts.append(f'  - {err}')
+            return CodexApplyPatchObservation(
+                content='\n'.join(summary_parts),
+                files_changed=files_changed,
+                success=False,
+            )
+
+        if not files_changed:
+            return CodexApplyPatchObservation(
+                content='Patch parsed successfully but no files were changed.',
+                files_changed=[],
+                success=False,
+            )
+
+        summary = ['Patch applied successfully. Changed files:']
+        for p in added:
+            summary.append(f'  A {p}')
+        for p in modified:
+            summary.append(f'  M {p}')
+        for p in deleted:
+            summary.append(f'  D {p}')
+        return CodexApplyPatchObservation(
+            content='\n'.join(summary),
+            files_changed=files_changed,
+            success=True,
+        )
+
+    def _codex_parse_patch(self, patch_text: str) -> list[dict]:
+        """Parse Codex freeform patch format into a list of hunk dicts.
+
+        Returns a list of dicts, each with:
+          {'type': 'add', 'path': str, 'contents': str}
+          {'type': 'delete', 'path': str}
+          {'type': 'update', 'path': str, 'move_path': str|None,
+           'chunks': [{'context': str|None, 'old_lines': [str],
+                        'new_lines': [str], 'is_eof': bool}]}
+
+        Raises ValueError with a descriptive message on parse failure.
+        """
+        lines = patch_text.strip().splitlines()
+        if not lines:
+            raise ValueError('Patch text is empty')
+
+        # Strip heredoc wrapper if present (lenient mode, like gpt-4.1)
+        if lines[0].strip() in ("<<EOF", "<<'EOF'", '<<"EOF"'):
+            if len(lines) >= 4 and lines[-1].strip().endswith('EOF'):
+                lines = lines[1:-1]
+
+        # Validate *** Begin Patch / *** End Patch boundaries
+        if lines[0].strip() != '*** Begin Patch':
+            raise ValueError(
+                f"Expected '*** Begin Patch' on line 1, got: '{lines[0].strip()}'"
+            )
+        if lines[-1].strip() != '*** End Patch':
+            raise ValueError(
+                f"Expected '*** End Patch' on the last line, got: '{lines[-1].strip()}'"
+            )
+
+        # Work with content between markers
+        content_lines = lines[1:-1]
+        hunks: list[dict] = []
+        i = 0
+
+        while i < len(content_lines):
+            line = content_lines[i].strip()
+
+            # Skip blank lines between hunks
+            if not line:
+                i += 1
+                continue
+
+            if line.startswith('*** Add File: '):
+                path = line[len('*** Add File: '):]
+                if not path:
+                    raise ValueError(
+                        f"Empty path in '*** Add File:' on line {i + 2}"
+                    )
+                contents = ''
+                i += 1
+                while i < len(content_lines):
+                    if content_lines[i].startswith('+'):
+                        contents += content_lines[i][1:] + '\n'
+                        i += 1
+                    else:
+                        break
+                hunks.append({
+                    'type': 'add',
+                    'path': path,
+                    'contents': contents,
+                })
+
+            elif line.startswith('*** Delete File: '):
+                path = line[len('*** Delete File: '):]
+                if not path:
+                    raise ValueError(
+                        f"Empty path in '*** Delete File:' on line {i + 2}"
+                    )
+                hunks.append({'type': 'delete', 'path': path})
+                i += 1
+
+            elif line.startswith('*** Update File: '):
+                path = line[len('*** Update File: '):]
+                if not path:
+                    raise ValueError(
+                        f"Empty path in '*** Update File:' on line {i + 2}"
+                    )
+                i += 1
+
+                # Optional: *** Move to: <path>
+                move_path = None
+                if i < len(content_lines) and content_lines[i].strip().startswith('*** Move to: '):
+                    move_path = content_lines[i].strip()[len('*** Move to: '):]
+                    i += 1
+
+                # Parse chunks within this Update File hunk
+                chunks: list[dict] = []
+                while i < len(content_lines):
+                    raw = content_lines[i]
+                    stripped = raw.strip()
+
+                    # Skip blank lines between chunks
+                    if not stripped:
+                        i += 1
+                        continue
+
+                    # Stop at next file-level marker
+                    if stripped.startswith('***'):
+                        break
+
+                    # Parse one chunk
+                    chunk, lines_consumed = self._codex_parse_update_chunk(
+                        content_lines, i, len(chunks) == 0
+                    )
+                    chunks.append(chunk)
+                    i += lines_consumed
+
+                if not chunks:
+                    raise ValueError(
+                        f"Update File hunk for '{path}' contains no change chunks"
+                    )
+
+                hunks.append({
+                    'type': 'update',
+                    'path': path,
+                    'move_path': move_path,
+                    'chunks': chunks,
+                })
+
+            else:
+                raise ValueError(
+                    f"Unexpected line {i + 2}: '{line}'. "
+                    f"Expected '*** Add File:', '*** Delete File:', "
+                    f"or '*** Update File:'"
+                )
+
+        return hunks
+
+    def _codex_parse_update_chunk(
+        self, lines: list[str], start: int, allow_missing_context: bool
+    ) -> tuple[dict, int]:
+        """Parse a single update chunk within an Update File hunk.
+
+        Returns (chunk_dict, lines_consumed).
+        chunk_dict has: context, old_lines, new_lines, is_eof
+        """
+        line = lines[start]
+
+        # Check for @@ context marker
+        context = None
+        idx = start
+        if line.strip() == '@@':
+            context = None
+            idx += 1
+        elif line.startswith('@@ '):
+            context = line[3:]
+            idx += 1
+        else:
+            if not allow_missing_context:
+                raise ValueError(
+                    f"Expected '@@ ...' context marker on line {start + 2}, "
+                    f"got: '{line.strip()}'"
+                )
+
+        old_lines: list[str] = []
+        new_lines: list[str] = []
+        is_eof = False
+        parsed = 0
+
+        while idx < len(lines):
+            raw = lines[idx]
+
+            # *** End of File marker
+            if raw.strip() == '*** End of File':
+                if parsed == 0:
+                    raise ValueError(
+                        f"Empty update chunk at line {idx + 2}"
+                    )
+                is_eof = True
+                idx += 1
+                parsed += 1
+                break
+
+            # Next file-level hunk or next @@ chunk
+            if raw.strip().startswith('***'):
+                break
+            if raw.startswith('@@') and parsed > 0:
+                break
+
+            first_char = raw[0] if raw else ''
+
+            if first_char == ' ':
+                # Context line: goes into both old and new
+                old_lines.append(raw[1:])
+                new_lines.append(raw[1:])
+            elif first_char == '+':
+                new_lines.append(raw[1:])
+            elif first_char == '-':
+                old_lines.append(raw[1:])
+            elif raw == '':
+                # Empty line interpreted as empty context
+                old_lines.append('')
+                new_lines.append('')
+            else:
+                if parsed == 0:
+                    raise ValueError(
+                        f"Unexpected line {idx + 2} in update chunk: '{raw}'. "
+                        f"Lines must start with ' ' (context), '+' (add), "
+                        f"or '-' (remove)"
+                    )
+                # Assume start of next chunk
+                break
+
+            idx += 1
+            parsed += 1
+
+        lines_consumed = idx - start
+        return {
+            'context': context,
+            'old_lines': old_lines,
+            'new_lines': new_lines,
+            'is_eof': is_eof,
+        }, lines_consumed
+
+    @staticmethod
+    def _codex_seek_sequence(
+        lines: list[str],
+        pattern: list[str],
+        start: int,
+        eof: bool = False,
+    ) -> int | None:
+        """Find a sequence of pattern lines within lines, starting at or after start.
+
+        Matches with decreasing strictness: exact, rstrip, trim, unicode-normalized.
+        When eof=True, searches from end of file first.
+        Returns starting index or None.
+        """
+        if not pattern:
+            return start
+        if len(pattern) > len(lines):
+            return None
+
+        search_start = (
+            len(lines) - len(pattern) if eof and len(lines) >= len(pattern)
+            else start
+        )
+        end = len(lines) - len(pattern)
+
+        # Exact match
+        for i in range(search_start, end + 1):
+            if lines[i:i + len(pattern)] == pattern:
+                return i
+
+        # rstrip match
+        for i in range(search_start, end + 1):
+            if all(
+                lines[i + j].rstrip() == p.rstrip()
+                for j, p in enumerate(pattern)
+            ):
+                return i
+
+        # trim match (strip both sides)
+        for i in range(search_start, end + 1):
+            if all(
+                lines[i + j].strip() == p.strip()
+                for j, p in enumerate(pattern)
+            ):
+                return i
+
+        # Unicode-normalized match
+        def _normalize(s: str) -> str:
+            result = []
+            for c in s.strip():
+                if c in '\u2010\u2011\u2012\u2013\u2014\u2015\u2212':
+                    result.append('-')
+                elif c in '\u2018\u2019\u201a\u201b':
+                    result.append("'")
+                elif c in '\u201c\u201d\u201e\u201f':
+                    result.append('"')
+                elif c in '\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000':
+                    result.append(' ')
+                else:
+                    result.append(c)
+            return ''.join(result)
+
+        for i in range(search_start, end + 1):
+            if all(
+                _normalize(lines[i + j]) == _normalize(p)
+                for j, p in enumerate(pattern)
+            ):
+                return i
+
+        return None
+
+    def _codex_apply_update_hunk(
+        self, full_path: str, chunks: list[dict]
+    ) -> str | None:
+        """Apply update chunks to a file. Returns error string or None on success."""
+        try:
+            with open(full_path, 'r', encoding='utf-8') as f:
+                original_contents = f.read()
+        except Exception as e:
+            return f'Failed to read file: {e}'
+
+        original_lines = original_contents.split('\n')
+        # Drop trailing empty element from final newline (matches Rust behavior)
+        if original_lines and original_lines[-1] == '':
+            original_lines.pop()
+
+        line_index = 0
+
+        # Compute replacements: list of (start_idx, old_len, new_lines)
+        replacements: list[tuple[int, int, list[str]]] = []
+
+        for chunk_idx, chunk in enumerate(chunks):
+            context = chunk.get('context')
+            old_lines = chunk['old_lines']
+            new_lines = chunk['new_lines']
+            is_eof = chunk.get('is_eof', False)
+
+            # If chunk has a context line, seek to it
+            if context is not None:
+                ctx_idx = self._codex_seek_sequence(
+                    original_lines, [context], line_index, False
+                )
+                if ctx_idx is None:
+                    return (
+                        f"Chunk {chunk_idx + 1}: could not find context "
+                        f"line '{context}' in file "
+                        f"(searched from line {line_index + 1})"
+                    )
+                line_index = ctx_idx + 1
+
+            # Pure addition (no old lines)
+            if not old_lines:
+                insertion_idx = (
+                    len(original_lines) - 1
+                    if original_lines and original_lines[-1] == ''
+                    else len(original_lines)
+                )
+                replacements.append((insertion_idx, 0, new_lines))
+                continue
+
+            # Seek old_lines in the file
+            pattern = old_lines
+            found = self._codex_seek_sequence(
+                original_lines, pattern, line_index, is_eof
+            )
+
+            new_slice = new_lines
+
+            # Retry without trailing empty line (handles EOF edge cases)
+            if found is None and pattern and pattern[-1] == '':
+                pattern = pattern[:-1]
+                if new_slice and new_slice[-1] == '':
+                    new_slice = new_slice[:-1]
+                found = self._codex_seek_sequence(
+                    original_lines, pattern, line_index, is_eof
+                )
+
+            if found is None:
+                # Build a descriptive error message
+                preview = old_lines[:5]
+                if len(old_lines) > 5:
+                    preview.append(f'... ({len(old_lines) - 5} more lines)')
+                preview_str = '\n'.join(f'  {l}' for l in preview)
+                return (
+                    f"Chunk {chunk_idx + 1}: could not find the expected "
+                    f"lines in file (searched from line {line_index + 1}).\n"
+                    f"Looking for:\n{preview_str}"
+                )
+
+            replacements.append((found, len(pattern), list(new_slice)))
+            line_index = found + len(pattern)
+
+        # Sort replacements by position
+        replacements.sort(key=lambda r: r[0])
+
+        # Apply replacements in reverse order so indices stay valid
+        for start_idx, old_len, new_segment in reversed(replacements):
+            del original_lines[start_idx:start_idx + old_len]
+            for offset, new_line in enumerate(new_segment):
+                original_lines.insert(start_idx + offset, new_line)
+
+        # Ensure trailing newline
+        if not original_lines or original_lines[-1] != '':
+            original_lines.append('')
+
+        try:
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(original_lines))
+        except Exception as e:
+            return f'Failed to write file: {e}'
+
+        return None
+
+    async def codex_update_plan(self, action: CodexUpdatePlanAction) -> Observation:
+        """Update the task plan."""
+        try:
+            plan_items = action.plan
+            if not isinstance(plan_items, list):
+                return ErrorObservation('plan must be a list of plan items')
+
+            # Validate plan items
+            in_progress_count = 0
+            for item in plan_items:
+                if not isinstance(item, dict):
+                    return ErrorObservation('Each plan item must be a dict with step and status')
+                if 'step' not in item or 'status' not in item:
+                    return ErrorObservation('Each plan item must have step and status fields')
+                if item['status'] not in ('pending', 'in_progress', 'completed'):
+                    return ErrorObservation(
+                        f"Invalid status '{item['status']}'. Must be: pending, in_progress, completed"
+                    )
+                if item['status'] == 'in_progress':
+                    in_progress_count += 1
+
+            if in_progress_count > 1:
+                return ErrorObservation('At most one step can be in_progress at a time')
+
+            # Store the plan (reuse _todos storage for plan items)
+            if not hasattr(self, '_plan'):
+                self._plan: list[dict] = []
+            self._plan = list(plan_items)
+
+            return CodexUpdatePlanObservation(
+                content='Plan updated',
+                plan=list(self._plan),
+                success=True,
+            )
+        except Exception as e:
+            logger.exception(f'Error updating plan: {e}')
+            return ErrorObservation(f'Failed to update plan: {str(e)}')
+
+    def _format_terminal_screen(
+        self, obs: CmdOutputObservation, command: str, pre_cwd: str | None = None
+    ) -> str:
+        """Format a CmdOutputObservation to look like a tmux capture-pane screen.
+
+        The pre-command prompt uses pre_cwd (the directory before execution),
+        and the post-command prompt uses the actual post-execution working_dir
+        from metadata. This matches real terminal behavior where e.g.
+        ``cd /app/src`` shows the old cwd before the command and the new cwd after.
+
+        Produces output like:
+            root@hostname:/app# cd /app/src
+            root@hostname:/app/src#
+        """
+        meta = obs.metadata
+        username = meta.username or 'root'
+        hostname = meta.hostname or 'sandbox'
+        post_cwd = meta.working_dir or '/'
+        suffix = '#' if username == 'root' else '$'
+
+        before_cwd = pre_cwd if pre_cwd else post_cwd
+        pre_prompt = f'{username}@{hostname}:{before_cwd}{suffix} '
+        post_prompt = f'{username}@{hostname}:{post_cwd}{suffix} '
+
+        lines = [f'{pre_prompt}{command}']
+        if obs.content.strip():
+            lines.append(obs.content)
+        lines.append(post_prompt)
+        return '\n'.join(lines)
+
+    async def terminus_2_cmd_run(
+        self, action: Terminus2CmdRunAction
+    ) -> Terminus2CmdOutputObservation | ErrorObservation:
+        """Execute Terminus-2 keystroke action via BashSession.
+
+        Converts keystrokes to a command, executes via the bash session,
+        and returns terminal output formatted like the original Terminus-2
+        tmux capture with appropriate prefix:
+        - "Current Terminal Screen:" for initial captures (empty keystrokes)
+          and timed-out commands
+        - "New Terminal Output:" for normal command output
+        """
+        try:
+            bash_session = self.bash_session
+            assert bash_session is not None
+
+            keystrokes = action.keystrokes
+            duration = min(action.duration, 60)
+            pre_cwd = bash_session.cwd
+
+            if keystrokes == '' or keystrokes.strip() == '':
+                cmd_action = CmdRunAction(command='pwd')
+                cmd_action.set_hard_timeout(duration + 5, blocking=False)
+                obs = await call_sync_from_async(bash_session.execute, cmd_action)
+                screen = self._format_terminal_screen(obs, 'pwd', pre_cwd)
+                terminal_state = f'Current Terminal Screen:\n{screen}'
+                return Terminus2CmdOutputObservation(
+                    content=terminal_state,
+                    terminal_state=terminal_state,
+                    timed_out=False,
+                    command_keystrokes=keystrokes,
+                )
+
+            if keystrokes.strip() in ('C-c', 'C-d'):
+                special_key = keystrokes.strip()
+                cmd_action = CmdRunAction(command=special_key)
+                cmd_action.set_hard_timeout(duration + 5, blocking=False)
+                obs = await call_sync_from_async(bash_session.execute, cmd_action)
+                screen = self._format_terminal_screen(obs, f'^{"C" if special_key == "C-c" else "D"}', pre_cwd)
+                terminal_state = f'New Terminal Output:\n{screen}'
+                return Terminus2CmdOutputObservation(
+                    content=terminal_state,
+                    terminal_state=terminal_state,
+                    timed_out=False,
+                    command_keystrokes=keystrokes,
+                )
+
+            command = keystrokes.rstrip('\n')
+            cmd_action = CmdRunAction(command=command)
+            cmd_action.set_hard_timeout(duration + 10, blocking=False)
+            obs = await call_sync_from_async(bash_session.execute, cmd_action)
+
+            timed_out = False
+            if hasattr(obs, 'metadata') and obs.metadata:
+                timed_out = getattr(obs.metadata, 'exit_code', 0) == -1
+
+            screen = self._format_terminal_screen(obs, command, pre_cwd)
+            if timed_out:
+                terminal_state = f'Current Terminal Screen:\n{screen}'
+            else:
+                terminal_state = f'New Terminal Output:\n{screen}'
+            return Terminus2CmdOutputObservation(
+                content=terminal_state,
+                terminal_state=terminal_state,
+                timed_out=timed_out,
+                command_keystrokes=keystrokes,
+            )
+        except Exception as e:
+            logger.exception(f'Error executing Terminus-2 keystrokes: {e}')
+            return ErrorObservation(str(e))
 
     async def browse(self, action: BrowseURLAction) -> Observation:
         if self.browser is None:

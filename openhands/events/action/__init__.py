@@ -24,6 +24,25 @@ from openhands.events.action.files import (
 )
 from openhands.events.action.mcp import MCPAction
 from openhands.events.action.message import MessageAction, SystemMessageAction
+from openhands.events.action.opencode import (
+    ApplyPatchAction,
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
+)
+from openhands.events.action.codex import (
+    CodexApplyPatchAction,
+    CodexGrepFilesAction,
+    CodexListDirAction,
+    CodexReadFileAction,
+    CodexUpdatePlanAction,
+)
+from openhands.events.action.terminus_2 import Terminus2CmdRunAction
 
 __all__ = [
     'Action',
@@ -49,4 +68,22 @@ __all__ = [
     'ActionSecurityRisk',
     'LoopRecoveryAction',
     'ValidationFailureAction',
+    # OpenCode-style actions
+    'GlobAction',
+    'GrepAction',
+    'ListDirAction',
+    'OpenCodeReadAction',
+    'OpenCodeWriteAction',
+    'QuestionAction',
+    'ApplyPatchAction',
+    'TodoReadAction',
+    'TodoWriteAction',
+    # Codex-style actions
+    'CodexReadFileAction',
+    'CodexListDirAction',
+    'CodexGrepFilesAction',
+    'CodexApplyPatchAction',
+    'CodexUpdatePlanAction',
+    # Terminus-2-style actions
+    'Terminus2CmdRunAction',
 ]

@@ -21,22 +21,51 @@ from openhands.events.action import (
     TaskTrackingAction,
 )
 from openhands.events.action.mcp import MCPAction
+from openhands.events.action.opencode import (
+    ApplyPatchAction,
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
+)
+from openhands.events.action.codex import (
+    CodexApplyPatchAction,
+    CodexGrepFilesAction,
+    CodexListDirAction,
+    CodexReadFileAction,
+    CodexUpdatePlanAction,
+)
+from openhands.events.action.terminus_2 import Terminus2CmdRunAction
 from openhands.events.action.message import SystemMessageAction
 from openhands.events.event import Event, RecallType
 from openhands.events.observation import (
     AgentCondensationObservation,
     AgentDelegateObservation,
     AgentThinkObservation,
+    ApplyPatchObservation,
     BrowserOutputObservation,
     CmdOutputObservation,
     FileDownloadObservation,
     FileEditObservation,
     FileReadObservation,
+    FileWriteObservation,
     IPythonRunCellObservation,
     LoopDetectionObservation,
+    QuestionObservation,
     TaskTrackingObservation,
+    TodoReadObservation,
+    TodoWriteObservation,
     UserRejectObservation,
 )
+from openhands.events.observation.codex import (
+    CodexApplyPatchObservation,
+    CodexUpdatePlanObservation,
+)
+from openhands.events.observation.terminus_2 import Terminus2CmdOutputObservation
 from openhands.events.observation.agent import (
     MicroagentKnowledge,
     RecallObservation,
@@ -232,6 +261,24 @@ class ConversationMemory:
                 BrowseURLAction,
                 MCPAction,
                 TaskTrackingAction,
+                # OpenCode-style actions
+                GlobAction,
+                GrepAction,
+                ListDirAction,
+                OpenCodeReadAction,
+                OpenCodeWriteAction,
+                QuestionAction,
+                ApplyPatchAction,
+                TodoReadAction,
+                TodoWriteAction,
+                # Codex-style actions
+                CodexReadFileAction,
+                CodexListDirAction,
+                CodexGrepFilesAction,
+                CodexApplyPatchAction,
+                CodexUpdatePlanAction,
+                # Terminus-2-style actions
+                Terminus2CmdRunAction,
             ),
         ) or (isinstance(action, CmdRunAction) and action.source == 'agent'):
             tool_metadata = action.tool_call_metadata
@@ -481,6 +528,12 @@ class ConversationMemory:
             message = Message(
                 role='user', content=[TextContent(text=obs.content)]
             )  # Content is already truncated by openhands-aci
+        elif isinstance(obs, FileWriteObservation):
+            text = truncate_content(
+                f'File written successfully: {obs.path}\n{obs.content}',
+                max_message_chars,
+            )
+            message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, BrowserOutputObservation):
             text = obs.content
             content = [TextContent(text=text)]
@@ -553,6 +606,29 @@ class ConversationMemory:
             message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, FileDownloadObservation):
             text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, TodoReadObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, TodoWriteObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, QuestionObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, ApplyPatchObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, CodexApplyPatchObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, CodexUpdatePlanObservation):
+            text = truncate_content(obs.content, max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
+        elif isinstance(obs, Terminus2CmdOutputObservation):
+            text = truncate_content(
+                obs.terminal_state or obs.content, max_message_chars
+            )
             message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, LoopDetectionObservation):
             # LoopRecovery should not be observed by llm, handled internally.

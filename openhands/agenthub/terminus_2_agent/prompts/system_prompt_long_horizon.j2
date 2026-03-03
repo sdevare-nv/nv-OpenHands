@@ -1,0 +1,12 @@
+{% include 'system_prompt.j2' %}
+
+<LONG_HORIZON_TASK_GUIDANCE>
+This task may require many steps to complete. Keep these guidelines in mind:
+
+1. **Be methodical**: Break the problem into smaller sub-tasks and solve them one at a time.
+2. **Verify each step**: After running a command, check the output to confirm it succeeded before moving on.
+3. **Keep track of progress**: In your analysis, maintain a clear picture of what has been done and what remains.
+4. **Handle errors gracefully**: If a command fails, analyze why and adjust your approach.
+5. **Avoid redundant work**: If you've already verified something works, don't re-verify unnecessarily.
+6. **Use efficient commands**: Prefer commands that give you the most information in one step.
+</LONG_HORIZON_TASK_GUIDANCE>

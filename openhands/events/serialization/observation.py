@@ -29,6 +29,17 @@ from openhands.events.observation.files import (
 from openhands.events.observation.loop_recovery import LoopDetectionObservation
 from openhands.events.observation.mcp import MCPObservation
 from openhands.events.observation.observation import Observation
+from openhands.events.observation.opencode import (
+    ApplyPatchObservation,
+    QuestionObservation,
+    TodoReadObservation,
+    TodoWriteObservation,
+)
+from openhands.events.observation.codex import (
+    CodexApplyPatchObservation,
+    CodexUpdatePlanObservation,
+)
+from openhands.events.observation.terminus_2 import Terminus2CmdOutputObservation
 from openhands.events.observation.reject import UserRejectObservation
 from openhands.events.observation.success import SuccessObservation
 from openhands.events.observation.task_tracking import TaskTrackingObservation
@@ -53,6 +64,15 @@ observations = (
     FileDownloadObservation,
     TaskTrackingObservation,
     LoopDetectionObservation,
+    QuestionObservation,
+    ApplyPatchObservation,
+    TodoReadObservation,
+    TodoWriteObservation,
+    # Codex-style observations
+    CodexApplyPatchObservation,
+    CodexUpdatePlanObservation,
+    # Terminus-2-style observations
+    Terminus2CmdOutputObservation,
 )
 
 OBSERVATION_TYPE_TO_CLASS = {

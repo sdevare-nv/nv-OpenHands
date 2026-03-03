@@ -2,11 +2,66 @@ import os
 from dataclasses import dataclass, field
 from itertools import islice
 
-from jinja2 import Environment, FileSystemLoader, Template
+from jinja2 import BaseLoader, Environment, FileSystemLoader, Template, TemplateNotFound
 
 from openhands.controller.state.state import State
 from openhands.core.message import Message, TextContent
 from openhands.events.observation.agent import MicroagentKnowledge
+
+
+class OverrideLoader(BaseLoader):
+    """A Jinja2 loader that allows specific templates to be loaded from custom paths.
+    
+    This loader checks if a template has a custom path override, and if so, loads from that path.
+    Otherwise, it falls back to loading from the default directory.
+    This allows {% include %} directives to work correctly while supporting custom template paths.
+    """
+    
+    def __init__(self, default_dir: str, overrides: dict[str, str] | None = None):
+        """Initialize the loader.
+        
+        Args:
+            default_dir: Default directory to load templates from
+            overrides: Dict mapping template names to absolute file paths
+        """
+        self.default_dir = default_dir
+        self.overrides = overrides or {}
+        self.default_loader = FileSystemLoader(default_dir)
+        
+        # Build a list of directories for included templates
+        # This allows {% include %} to find overridden templates
+        self.include_dirs = [default_dir]
+        for path in self.overrides.values():
+            if path and os.path.isfile(path):
+                dir_path = os.path.dirname(path)
+                if dir_path not in self.include_dirs:
+                    self.include_dirs.append(dir_path)
+        
+        self.include_loader = FileSystemLoader(self.include_dirs)
+    
+    def get_source(self, environment, template):
+        # Check if this template has an override
+        if template in self.overrides:
+            override_path = self.overrides[template]
+            if override_path and os.path.isfile(override_path):
+                with open(override_path, 'r', encoding='utf-8') as f:
+                    source = f.read()
+                return source, override_path, lambda: True
+        
+        # Also check by filename in case the override uses just the filename
+        template_basename = os.path.basename(template)
+        if template_basename in self.overrides:
+            override_path = self.overrides[template_basename]
+            if override_path and os.path.isfile(override_path):
+                with open(override_path, 'r', encoding='utf-8') as f:
+                    source = f.read()
+                return source, override_path, lambda: True
+        
+        # Fall back to the include loader which searches all directories
+        try:
+            return self.include_loader.get_source(environment, template)
+        except TemplateNotFound:
+            raise TemplateNotFound(template)
 
 
 @dataclass
@@ -53,12 +108,29 @@ class PromptManager:
         self,
         prompt_dir: str,
         system_prompt_filename: str = 'system_prompt.j2',
+        template_overrides: dict[str, str] | None = None,
     ):
+        """Initialize the PromptManager.
+        
+        Args:
+            prompt_dir: Default directory containing prompt templates.
+            system_prompt_filename: Name of the system prompt template file.
+            template_overrides: Optional dict mapping template names to absolute file paths.
+                              E.g., {'system_prompt.j2': '/path/to/custom/system_prompt.j2'}
+        """
         if prompt_dir is None:
             raise ValueError('Prompt directory is not set')
 
         self.prompt_dir: str = prompt_dir
-        self.env = Environment(loader=FileSystemLoader(prompt_dir))
+        self.template_overrides = template_overrides or {}
+        
+        # Use OverrideLoader if there are custom overrides, otherwise use standard loader
+        if self.template_overrides:
+            loader = OverrideLoader(prompt_dir, self.template_overrides)
+        else:
+            loader = FileSystemLoader(prompt_dir)
+        
+        self.env = Environment(loader=loader)
         self.system_template: Template = self._load_template(system_prompt_filename)
         self.user_template: Template = self._load_template('user_prompt.j2')
         self.additional_info_template: Template = self._load_template(

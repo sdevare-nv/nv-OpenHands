@@ -31,9 +31,28 @@ from openhands.events.action import (
     IPythonRunCellAction,
     ValidationFailureAction,
 )
+from openhands.events.action.opencode import (
+    ApplyPatchAction,
+    GlobAction,
+    GrepAction,
+    ListDirAction,
+    OpenCodeReadAction,
+    OpenCodeWriteAction,
+    QuestionAction,
+    TodoReadAction,
+    TodoWriteAction,
+)
+from openhands.events.action.codex import (
+    CodexApplyPatchAction,
+    CodexGrepFilesAction,
+    CodexListDirAction,
+    CodexReadFileAction,
+    CodexUpdatePlanAction,
+)
 from openhands.events.action.action import Action
 from openhands.events.action.files import FileEditSource
 from openhands.events.action.mcp import MCPAction
+from openhands.events.action.terminus_2 import Terminus2CmdRunAction
 from openhands.events.observation import (
     AgentThinkObservation,
     ErrorObservation,
@@ -368,6 +387,59 @@ class ActionExecutionClient(Runtime):
         return self.send_action_for_execution(action)
 
     def browse_interactive(self, action: BrowseInteractiveAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    # =========================================================================
+    # OpenCode-style action handlers
+    # =========================================================================
+
+    def glob(self, action: GlobAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def grep(self, action: GrepAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def list_dir(self, action: ListDirAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def opencode_read(self, action: OpenCodeReadAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def opencode_write(self, action: OpenCodeWriteAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def question(self, action: QuestionAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def apply_patch(self, action: ApplyPatchAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def todo_read(self, action: TodoReadAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def todo_write(self, action: TodoWriteAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    # =========================================================================
+    # Codex-style action handlers
+    # =========================================================================
+
+    def codex_read_file(self, action: CodexReadFileAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def codex_list_dir(self, action: CodexListDirAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def codex_grep_files(self, action: CodexGrepFilesAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def codex_apply_patch(self, action: CodexApplyPatchAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def codex_update_plan(self, action: CodexUpdatePlanAction) -> Observation:
+        return self.send_action_for_execution(action)
+
+    def terminus_2_cmd_run(self, action: Terminus2CmdRunAction) -> Observation:
         return self.send_action_for_execution(action)
 
     def get_mcp_config(

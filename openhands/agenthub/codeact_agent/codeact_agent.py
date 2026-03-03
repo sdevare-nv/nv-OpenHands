@@ -93,9 +93,26 @@ class CodeActAgent(Agent):
     @property
     def prompt_manager(self) -> PromptManager:
         if self._prompt_manager is None:
+            # Use custom prompt directory if configured, otherwise use default
+            prompt_dir = (
+                self.config.custom_prompt_dir
+                if self.config.custom_prompt_dir
+                else os.path.join(os.path.dirname(__file__), "prompts")
+            )
+
+            # Build template overrides from custom paths
+            template_overrides = {}
+            if self.config.system_prompt_path:
+                template_overrides["system_prompt.j2"] = self.config.system_prompt_path
+            if self.config.system_prompt_long_horizon_path:
+                template_overrides["system_prompt_long_horizon.j2"] = (
+                    self.config.system_prompt_long_horizon_path
+                )
+
             self._prompt_manager = PromptManager(
-                prompt_dir=os.path.join(os.path.dirname(__file__), 'prompts'),
+                prompt_dir=prompt_dir,
                 system_prompt_filename=self.config.resolved_system_prompt_filename,
+                template_overrides=template_overrides if template_overrides else None,
             )
 
         return self._prompt_manager

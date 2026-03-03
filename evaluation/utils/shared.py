@@ -153,6 +153,150 @@ def codeact_user_response(
     return msg
 
 
+def opencode_user_response(
+    state: State,
+    encapsulate_solution: bool = False,
+    try_parse: Callable[[Action], str] | None = None,
+) -> str:
+    encaps_str = (
+        (
+            'Your final answer MUST be encapsulated within <solution> and </solution>.\n'
+            'For example: The answer to the question is <solution> 42 </solution>.\n'
+        )
+        if encapsulate_solution
+        else ''
+    )
+    msg = (
+        'Please address this message and continue with your tasks.\n'
+        'If you have completed the task, use the finish tool to signal completion '
+        'with a clear summary of actions taken and their results.\n'
+        f'{encaps_str}'
+        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n'
+    )
+
+    if state.history:
+        if try_parse is not None:
+            last_action = next(
+                (
+                    event
+                    for event in reversed(state.history)
+                    if isinstance(event, Action)
+                ),
+                None,
+            )
+            ans = try_parse(last_action)
+            if ans is not None:
+                return '/exit'
+
+        user_msgs = [
+            event
+            for event in state.history
+            if isinstance(event, MessageAction) and event.source == 'user'
+        ]
+        if len(user_msgs) >= 2:
+            return (
+                msg
+                + 'If you want to give up, use the "finish" tool to finish the interaction.\n'
+            )
+    return msg
+
+
+def codex_user_response(
+    state: State,
+    encapsulate_solution: bool = False,
+    try_parse: Callable[[Action], str] | None = None,
+) -> str:
+    encaps_str = (
+        (
+            'Your final answer MUST be encapsulated within <solution> and </solution>.\n'
+            'For example: The answer to the question is <solution> 42 </solution>.\n'
+        )
+        if encapsulate_solution
+        else ''
+    )
+    msg = (
+        'Please keep going until the task is completely resolved. '
+        'Only terminate when you are sure that the problem is solved.\n'
+        'Autonomously resolve the task to the best of your ability before finishing.\n'
+        f'{encaps_str}'
+        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP. Do NOT guess or make up an answer.\n'
+    )
+
+    if state.history:
+        if try_parse is not None:
+            last_action = next(
+                (
+                    event
+                    for event in reversed(state.history)
+                    if isinstance(event, Action)
+                ),
+                None,
+            )
+            ans = try_parse(last_action)
+            if ans is not None:
+                return '/exit'
+
+        user_msgs = [
+            event
+            for event in state.history
+            if isinstance(event, MessageAction) and event.source == 'user'
+        ]
+        if len(user_msgs) >= 2:
+            return (
+                msg
+                + 'If you want to give up, use the "finish" tool to finish the interaction.\n'
+            )
+    return msg
+
+
+def terminus_2_user_response(
+    state: State,
+    encapsulate_solution: bool = False,
+    try_parse: Callable[[Action], str] | None = None,
+) -> str:
+    encaps_str = (
+        (
+            'Your final answer MUST be encapsulated within <solution> and </solution>.\n'
+            'For example: The answer to the question is <solution> 42 </solution>.\n'
+        )
+        if encapsulate_solution
+        else ''
+    )
+    msg = (
+        'Please continue working on the task. '
+        'Analyze the terminal output and issue the next batch of commands.\n'
+        'When the task is fully complete, set "task_complete": true in your JSON response.\n'
+        f'{encaps_str}'
+        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n'
+    )
+
+    if state.history:
+        if try_parse is not None:
+            last_action = next(
+                (
+                    event
+                    for event in reversed(state.history)
+                    if isinstance(event, Action)
+                ),
+                None,
+            )
+            ans = try_parse(last_action)
+            if ans is not None:
+                return '/exit'
+
+        user_msgs = [
+            event
+            for event in state.history
+            if isinstance(event, MessageAction) and event.source == 'user'
+        ]
+        if len(user_msgs) >= 2:
+            return (
+                msg
+                + 'If you want to give up, set "task_complete": true in your JSON response.\n'
+            )
+    return msg
+
+
 def cleanup():
     print('Cleaning up child processes...')
     for process in mp.active_children():
