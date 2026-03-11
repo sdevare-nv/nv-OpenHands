@@ -30,12 +30,10 @@ if [ -d /workspace/$WORKSPACE_NAME ]; then
     rm -rf /workspace/$WORKSPACE_NAME
 fi
 
-# Use cp with hard links (-al) for near-instant copy
-# Falls back to regular copy if hard links fail (different filesystems)
-if ! cp -al /testbed /workspace/$WORKSPACE_NAME 2>/dev/null; then
-    echo "Hard link copy failed, falling back to regular copy..."
+# Copy /testbed to /workspace.
+# Try hard-link copy first (near-instant); fall back to regular copy.
+cp -al /testbed /workspace/$WORKSPACE_NAME 2>/dev/null || \
     cp -r /testbed /workspace/$WORKSPACE_NAME
-fi
 
 # Activate instance-specific environment
 if [ -d /opt/miniconda3 ]; then

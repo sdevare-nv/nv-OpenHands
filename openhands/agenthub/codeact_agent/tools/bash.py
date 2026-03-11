@@ -1,3 +1,4 @@
+from os import getenv
 from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 
 from openhands.agenthub.codeact_agent.tools.prompt import refine_prompt
@@ -45,6 +46,8 @@ def create_cmd_run_tool(
     description = (
         _SHORT_BASH_DESCRIPTION if use_short_description else _DETAILED_BASH_DESCRIPTION
     )
+    command_execution_timeout = int(getenv("COMMAND_EXEC_TIMEOUT", "300"))
+
     return ChatCompletionToolParam(
         type='function',
         function=ChatCompletionToolParamFunctionChunk(
@@ -68,7 +71,7 @@ def create_cmd_run_tool(
                     },
                     'timeout': {
                         'type': 'number',
-                        'description': 'Optional. Sets a hard timeout in seconds for the command execution. If not provided, the command will use the default soft timeout behavior. Max value is 600 seconds.',
+                        'description': f'Optional. Sets a hard timeout in seconds for the command execution. If not provided, the command will use the default soft timeout behavior. Max timeout allowed is {command_execution_timeout} seconds.',
                     },
                     'security_risk': {
                         'type': 'string',

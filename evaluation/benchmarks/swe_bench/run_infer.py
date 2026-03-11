@@ -55,11 +55,12 @@ from openhands.core.config.utils import get_condenser_config_arg
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.main import create_runtime, run_controller
 from openhands.critic import AgentFinishedCritic
-from openhands.events.action import CmdRunAction, FileReadAction, MessageAction
+from openhands.events.action import  CmdRunAction, FileReadAction, MessageAction
 from openhands.events.observation import (
     CmdOutputObservation,
     ErrorObservation,
     FileReadObservation,
+    Observation,
 )
 from openhands.events.serialization.event import event_from_dict, event_to_dict
 from openhands.runtime.base import Runtime
@@ -95,6 +96,8 @@ def set_dataset_type(dataset_name: str) -> str:
         DATASET_TYPE = 'SWE-rebench'
     elif 'multimodal' in name_lower:
         DATASET_TYPE = 'Multimodal'
+    elif 'multilingual' in name_lower:
+        DATASET_TYPE = 'SWE-Multilingual'
     else:
         DATASET_TYPE = 'SWE-bench'
 
@@ -199,6 +202,8 @@ def get_instance_docker_image(
             docker_image_prefix = 'docker.io/swerebench/'
         elif DATASET_TYPE in ['R2E-Gym', 'nv-internal-1']:
             docker_image_prefix = 'UNAVAILABLE'
+        elif DATASET_TYPE == 'SWE-Multilingual':
+            docker_image_prefix = 'docker.io/swebench/'
         repo, name = instance_id.split('__')
         image_name = f'{docker_image_prefix.rstrip("/")}/sweb.eval.x86_64.{repo}_1776_{name}:latest'.lower()
         logger.debug(f'Using official SWE-Bench image: {image_name}')
@@ -426,9 +431,9 @@ source ~/.bashrc
             obs = runtime.run_action(action)
             logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
-    if DATASET_TYPE not in ('Multimodal', 'SWE-bench-Live', 'nv-internal-1'):
+    if DATASET_TYPE not in ('Multimodal', 'SWE-bench-Live', 'nv-internal-1', 'SWE-Multilingual'):
         # Only for non-multimodal datasets, we need to activate the testbed environment for Python
-        # SWE-Bench multimodal datasets, SWE-bench-Live, and nv-internal-1 are not using the testbed environment
+        # SWE-Bench multimodal datasets, SWE-bench-Live, nv-internal-1, and SWE-Multilingual are not using the testbed environment
         action = CmdRunAction(command='which python')
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
@@ -635,12 +640,76 @@ def complete_runtime(
     return {'git_patch': git_patch}
 
 
+def _has_existing_result(eval_output_dir: str, instance_id: str) -> tuple[bool, dict | None]:
+    completions_dir = os.path.join(eval_output_dir, 'llm_completions', instance_id)
+    has_completions = False
+    if os.path.exists(completions_dir):
+        json_files = [f for f in os.listdir(completions_dir) if f.endswith('.json')]
+        has_completions = len(json_files) > 0
+
+    if not has_completions:
+        return False, None
+
+    output_file = os.path.join(eval_output_dir, 'output.jsonl')
+    existing_result = None
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                for line in f:
+                    try:
+                        result = json.loads(line.strip())
+                        if result.get('instance_id') == instance_id:
+                            git_patch = result.get('test_result', {}).get('git_patch', '')
+                            if git_patch and git_patch.strip():
+                                existing_result = result
+                                break
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.warning(f'Error reading output file for existing result: {e}')
+
+    if has_completions:
+        return True, existing_result
+
+    return False, None
+
+
 def process_instance(
     instance: pd.Series,
     metadata: EvalMetadata,
     reset_logger: bool = True,
     runtime_failure_count: int = 0,
 ) -> EvalOutput:
+
+    should_skip, existing_result = _has_existing_result(metadata.eval_output_dir, instance.instance_id)
+    if should_skip:
+        if existing_result:
+            return EvalOutput(
+                instance_id=existing_result.get('instance_id', instance.instance_id),
+                instruction=existing_result.get('instruction', ''),
+                instance=existing_result.get('instance', instance.to_dict()),
+                test_result=existing_result.get('test_result', {}),
+                metadata=metadata,
+                history=existing_result.get('history', []),
+                metrics=existing_result.get('metrics', {}),
+                error=existing_result.get('error'),
+            )
+        else:
+            return EvalOutput(
+                instance_id=instance.instance_id,
+                instruction='',
+                instance=instance.to_dict(),
+                test_result={
+                    'git_patch': '',
+                    'skipped': True,
+                    'skip_reason': 'completions_exist_no_result',
+                },
+                metadata=metadata,
+                history=[],
+                metrics={},
+                error=None,
+            )
+
     config = get_config(instance, metadata)
 
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
@@ -733,6 +802,9 @@ def process_instance(
     histories = [event_to_dict(event) for event in state.history]
     metrics = get_metrics(state)
 
+    # Calculate action execution times from history
+    metrics['action_execution_latencies'] = get_action_execution_latencies(state.history)
+
     # Save the output
     instruction = message_action.content
     if message_action.image_urls:
@@ -750,6 +822,25 @@ def process_instance(
         error=state.last_error if state and state.last_error else None,
     )
     return output
+
+
+def get_action_execution_latencies(history: list) -> list[dict]:
+    """Extract execution latencies from observations in the history."""
+    latencies = []
+    for event in history:
+        if isinstance(event, Observation):
+            execution_latency = getattr(event, '_execution_latency', None)
+            if execution_latency is None:
+                execution_latency = getattr(event, 'execution_latency', None)
+            if execution_latency is not None:
+                latencies.append({
+                    'observation_type': type(event).__name__,
+                    'observation_id': str(event.id),
+                    'latency': float(execution_latency),
+                    'message': event.message,
+                    'timestamp': event.timestamp,
+                })
+    return latencies
 
 
 def filter_dataset(

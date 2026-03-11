@@ -61,3 +61,6 @@ class ObservationType(str, Enum):
 
     LOOP_DETECTION = 'loop_detection'
     """Results of a dead-loop detection"""
+
+    VALIDATION_FAILURE = 'validation_failure'
+    """Result of a validation failure for a function call"""
