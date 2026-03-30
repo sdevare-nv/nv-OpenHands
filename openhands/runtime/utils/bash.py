@@ -7,7 +7,6 @@ from typing import Any
 
 import bashlex
 import libtmux
-
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import CmdRunAction
 from openhands.events.observation import ErrorObservation
@@ -28,6 +27,7 @@ SU_TO_USER = os.getenv('SU_TO_USER', 'true').lower() in (
     'y',
     'on',
 )
+BASH_BACKEND = os.getenv('OPENHANDS_BASH_BACKEND', 'tmux').lower()
 
 
 def split_bash_commands(commands: str) -> list[str]:
