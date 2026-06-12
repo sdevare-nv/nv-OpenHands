@@ -233,7 +233,11 @@ class CodeActAgent(Agent):
             )
         }
 
-        response = await self.nemo_gym_client.model_call(messages, params['tools'])
+        response = await self.nemo_gym_client.model_call(
+            messages,
+            params['tools'],
+            request_kwargs={'extra_body': params['extra_body']},
+        )
 
         ng_openhands_should_log = os.environ.get("NG_OPENHANDS_SHOULD_LOG", "").lower() == "true"
         if ng_openhands_should_log:

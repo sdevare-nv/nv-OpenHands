@@ -70,6 +70,9 @@ class Message(BaseModel):
     prompt_token_ids: list[int] | None = None
     generation_token_ids: list[int] | None = None
     generation_log_probs: list[float] | None = None
+    prompt_moe_topk_indices: dict[str, Any] | list[Any] | None = None
+    generation_moe_topk_indices: dict[str, Any] | list[Any] | None = None
+    moe_metadata: dict[str, Any] | list[Any] | None = None
 
     @property
     def contains_image(self) -> bool:
@@ -166,5 +169,11 @@ class Message(BaseModel):
             message_dict['generation_token_ids'] = self.generation_token_ids
         if self.generation_log_probs is not None:
             message_dict['generation_log_probs'] = self.generation_log_probs
+        if self.prompt_moe_topk_indices is not None:
+            message_dict['prompt_moe_topk_indices'] = self.prompt_moe_topk_indices
+        if self.generation_moe_topk_indices is not None:
+            message_dict['generation_moe_topk_indices'] = self.generation_moe_topk_indices
+        if self.moe_metadata is not None:
+            message_dict['moe_metadata'] = self.moe_metadata
 
         return message_dict

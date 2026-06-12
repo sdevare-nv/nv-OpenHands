@@ -179,7 +179,11 @@ class CodexAgent(Agent):
                 model_name=self.llm.config.model, agent_name=self.name
             )
         }
-        response = await self.nemo_gym_client.model_call(messages, params["tools"])
+        response = await self.nemo_gym_client.model_call(
+            messages,
+            params["tools"],
+            request_kwargs={"extra_body": params["extra_body"]},
+        )
         logger.debug(f"Response from LLM: {response}")
         actions = self.response_to_actions(response)
         logger.debug(f"Actions after response_to_actions: {actions}")
