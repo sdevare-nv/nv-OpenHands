@@ -15,7 +15,6 @@ import openhands.agenthub.opencode_agent.function_calling as opencode_function_c
 from openhands.agenthub.opencode_agent.tools.apply_patch import ApplyPatchTool
 from openhands.agenthub.opencode_agent.tools.bash import create_cmd_run_tool
 from openhands.agenthub.opencode_agent.tools.edit import EditTool
-from openhands.agenthub.opencode_agent.tools.finish import FinishTool
 from openhands.agenthub.opencode_agent.tools.glob import GlobTool
 from openhands.agenthub.opencode_agent.tools.grep import GrepTool
 from openhands.agenthub.opencode_agent.tools.list_dir import ListDirTool
@@ -110,9 +109,22 @@ class OpenCodeAgent(Agent):
                     self.config.system_prompt_long_horizon_path
                 )
 
+            has_prompt_override = any(
+                (
+                    self.config.custom_prompt_dir,
+                    self.config.system_prompt_path,
+                    self.config.system_prompt_long_horizon_path,
+                )
+            )
+            system_prompt_filename = (
+                self.config.resolved_system_prompt_filename
+                if has_prompt_override
+                else self.config.system_prompt_filename
+            )
+
             self._prompt_manager = PromptManager(
                 prompt_dir=prompt_dir,
-                system_prompt_filename=self.config.resolved_system_prompt_filename,
+                system_prompt_filename=system_prompt_filename,
                 template_overrides=template_overrides if template_overrides else None,
             )
 
@@ -149,9 +161,6 @@ class OpenCodeAgent(Agent):
                 for substr in ["gpt-4", "o3", "o1", "o4"]
             )
             tools.append(create_cmd_run_tool(use_short_description=use_short_desc))
-
-        if self.config.enable_finish:
-            tools.append(FinishTool)
 
         return tools
 

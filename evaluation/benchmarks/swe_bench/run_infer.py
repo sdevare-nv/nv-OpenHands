@@ -31,8 +31,6 @@ from evaluation.utils.shared import (
     assert_and_raise,
     check_maximum_retries_exceeded,
     codeact_user_response,
-    codex_user_response,
-    opencode_user_response,
     terminus_2_user_response,
     get_default_sandbox_config_for_eval,
     get_metrics,
@@ -203,10 +201,10 @@ def set_dataset_type(dataset_name: str) -> str:
 
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
     'CodeActAgent': codeact_user_response,
-    'OpenCodeAgent': opencode_user_response,
-    'CodexAgent': codex_user_response,
     'Terminus2Agent': terminus_2_user_response,
 }
+
+AGENT_CLASSES_THAT_STOP_WITHOUT_TOOL_CALL = {'OpenCodeAgent', 'CodexAgent'}
 
 
 def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
@@ -1671,9 +1669,13 @@ def process_instance(
                 config=config,
                 initial_user_action=message_action,
                 runtime=runtime,
-                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
+                exit_on_message=(
                     metadata.agent_class
-                ],
+                    in AGENT_CLASSES_THAT_STOP_WITHOUT_TOOL_CALL
+                ),
+                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(
+                    metadata.agent_class
+                ),
                 replay_events=replay_events,
             )
         )

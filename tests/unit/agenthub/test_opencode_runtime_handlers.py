@@ -5,6 +5,7 @@ using real file operations on temporary directories, without requiring Docker.
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import tempfile
@@ -96,7 +97,7 @@ def create_test_structure(base_dir: str) -> dict:
 
 def run(coro):
     """Helper to run async coroutines in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # ==============================================================================
@@ -112,43 +113,63 @@ class TestOpenCodeReadHandler:
         return _make_executor(temp_workspace, ['opencode_read'])
 
     def test_read_file_line_number_format(self, executor, temp_workspace):
-        """Test 5-digit zero-padded line numbers with | separator."""
-        create_test_file(temp_workspace, 'test.txt', 'line 1\nline 2\nline 3')
-        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'test.txt'))
+        """Read uses the current XML envelope and 1-based line numbers."""
+        filepath = create_test_file(
+            temp_workspace, 'test.txt', 'line 1\nline 2\nline 3'
+        )
+        action = OpenCodeReadAction(path=filepath)
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert '00001| line 1' in obs.content
-        assert '00002| line 2' in obs.content
-        assert '00003| line 3' in obs.content
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '1: line 1\n'
+            '2: line 2\n'
+            '3: line 3\n\n'
+            '(End of file - total 3 lines)\n'
+            '</content>'
+        )
 
     def test_read_file_with_offset(self, executor, temp_workspace):
-        """Test reading file starting from offset (0-indexed)."""
+        """Offset is a 1-based source line and continuation is also 1-based."""
         content = '\n'.join([f'line {i}' for i in range(1, 101)])
-        create_test_file(temp_workspace, 'test.txt', content)
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'test.txt'), offset=49, limit=5
-        )
+        filepath = create_test_file(temp_workspace, 'test.txt', content)
+        action = OpenCodeReadAction(path=filepath, offset=50, limit=5)
         obs = run(executor.opencode_read(action))
-        assert '00050| line 50' in obs.content
-        assert '00054| line 54' in obs.content
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '50: line 50\n'
+            '51: line 51\n'
+            '52: line 52\n'
+            '53: line 53\n'
+            '54: line 54\n\n'
+            '(Showing lines 50-54 of 100. Use offset=55 to continue.)\n'
+            '</content>'
+        )
 
     def test_read_file_with_limit(self, executor, temp_workspace):
         """Test reading file with line limit."""
         content = '\n'.join([f'line {i}' for i in range(1, 101)])
-        create_test_file(temp_workspace, 'test.txt', content)
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'test.txt'), limit=3
-        )
+        filepath = create_test_file(temp_workspace, 'test.txt', content)
+        action = OpenCodeReadAction(path=filepath, limit=3)
         obs = run(executor.opencode_read(action))
-        assert '00001| line 1' in obs.content
-        assert '00003| line 3' in obs.content
-        assert '00004|' not in obs.content
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '1: line 1\n'
+            '2: line 2\n'
+            '3: line 3\n\n'
+            '(Showing lines 1-3 of 100. Use offset=4 to continue.)\n'
+            '</content>'
+        )
 
     def test_read_nonexistent_file(self, executor, temp_workspace):
         """Test reading a nonexistent file returns error."""
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'nonexistent.py')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'nonexistent.py'))
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, ErrorObservation)
         assert 'not found' in obs.content.lower()
@@ -176,29 +197,73 @@ class TestOpenCodeReadHandler:
     def test_read_text_file_not_binary(self, executor, temp_workspace):
         """Test that text files are read normally."""
         create_test_file(temp_workspace, 'text.py', 'print("hello")')
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'text.py')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'text.py'))
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, CmdOutputObservation)
         assert 'print("hello")' in obs.content
 
-    def test_read_directory_is_error(self, executor, temp_workspace):
-        """Test that reading a directory returns error."""
+    def test_read_strips_utf8_bom_from_model_body(self, executor, temp_workspace):
+        filepath = os.path.join(temp_workspace, 'bom.txt')
+        with open(filepath, 'wb') as target:
+            target.write(b'\xef\xbb\xbfhello\n')
+
+        obs = run(executor.opencode_read(OpenCodeReadAction(path=filepath)))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert '\ufeff' not in obs.content
+        assert '\n1: hello\n\n' in obs.content
+
+    @pytest.mark.parametrize(
+        ('signature', 'expected'),
+        [
+            (b'\x89PNG\r\n\x1a\nrest', 'Image read successfully'),
+            (b'\xff\xd8\xffrest', 'Image read successfully'),
+            (b'GIF89arest', 'Image read successfully'),
+            (b'RIFF\x04\x00\x00\x00WEBPrest', 'Image read successfully'),
+            (b'%PDF-1.7\nrest', 'PDF read successfully'),
+        ],
+    )
+    def test_read_magic_sniffs_extensionless_media(
+        self,
+        executor,
+        temp_workspace,
+        signature,
+        expected,
+    ):
+        filepath = os.path.join(temp_workspace, 'attachment')
+        with open(filepath, 'wb') as target:
+            target.write(signature)
+
+        obs = run(executor.opencode_read(OpenCodeReadAction(path=filepath)))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == expected
+
+    def test_read_directory_returns_immediate_entries(self, executor, temp_workspace):
+        """Read accepts directories and returns only their immediate entries."""
         subdir = os.path.join(temp_workspace, 'subdir')
         os.makedirs(subdir)
+        create_test_file(subdir, 'alpha.txt', '')
+        os.makedirs(os.path.join(subdir, 'nested'))
+        create_test_file(subdir, 'nested/not-shown.txt', '')
         action = OpenCodeReadAction(path=subdir)
         obs = run(executor.opencode_read(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'directory' in obs.content.lower()
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == (
+            f'<path>{subdir}</path>\n'
+            '<type>directory</type>\n'
+            '<entries>\n'
+            'alpha.txt\n'
+            'nested/\n\n'
+            '(2 entries)\n'
+            '</entries>'
+        )
 
     def test_read_file_suggestions(self, executor, temp_workspace):
         """Test similar filenames are suggested when not found."""
         create_test_file(temp_workspace, 'mymodule.py', 'content')
         create_test_file(temp_workspace, 'mymodule_test.py', 'content')
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'mymodule')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'mymodule'))
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, ErrorObservation)
         assert 'did you mean' in obs.content.lower()
@@ -206,33 +271,51 @@ class TestOpenCodeReadHandler:
     def test_read_empty_file(self, executor, temp_workspace):
         """Test reading an empty file."""
         create_test_file(temp_workspace, 'empty.txt', '')
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'empty.txt')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'empty.txt'))
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert '<file>' in obs.content
-        assert '</file>' in obs.content
+        filepath = os.path.join(temp_workspace, 'empty.txt')
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n\n\n'
+            '(End of file - total 0 lines)\n'
+            '</content>'
+        )
 
     def test_read_file_long_line_truncation(self, executor, temp_workspace):
         """Test that long lines are truncated."""
         long_line = 'x' * 3000
-        create_test_file(temp_workspace, 'long.txt', long_line)
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'long.txt')
-        )
+        filepath = create_test_file(temp_workspace, 'long.txt', long_line)
+        action = OpenCodeReadAction(path=filepath)
         obs = run(executor.opencode_read(action))
-        assert '...' in obs.content
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            f'1: {"x" * 2000}... (line truncated to 2000 chars)\n\n'
+            '(End of file - total 1 lines)\n'
+            '</content>'
+        )
 
     def test_read_file_has_more_indicator(self, executor, temp_workspace):
         """Test that output indicates when more lines exist."""
         content = '\n'.join([f'line {i}' for i in range(1, 50)])
-        create_test_file(temp_workspace, 'big.txt', content)
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'big.txt'), limit=5
-        )
+        filepath = create_test_file(temp_workspace, 'big.txt', content)
+        action = OpenCodeReadAction(path=filepath, limit=5)
         obs = run(executor.opencode_read(action))
-        assert 'more' in obs.content.lower() or 'offset' in obs.content.lower()
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '1: line 1\n'
+            '2: line 2\n'
+            '3: line 3\n'
+            '4: line 4\n'
+            '5: line 5\n\n'
+            '(Showing lines 1-5 of 49. Use offset=6 to continue.)\n'
+            '</content>'
+        )
 
     def test_read_file_end_of_file_indicator(self, executor, temp_workspace):
         """Test end-of-file indicator when reading to end."""
@@ -254,21 +337,23 @@ class TestOpenCodeReadHandler:
     def test_read_file_unicode_content(self, executor, temp_workspace):
         """Test reading file with Unicode content."""
         create_test_file(temp_workspace, 'uni.txt', 'naïve café ✅\nline 2')
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'uni.txt')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'uni.txt'))
         obs = run(executor.opencode_read(action))
         assert 'naïve café ✅' in obs.content
 
-    def test_read_file_wraps_in_file_tags(self, executor, temp_workspace):
-        """Test that output is wrapped in <file>...</file> tags."""
-        create_test_file(temp_workspace, 'test.txt', 'content')
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'test.txt')
-        )
+    def test_read_file_uses_path_type_and_content_tags(self, executor, temp_workspace):
+        """The model-visible envelope uses path, type, and content tags."""
+        filepath = create_test_file(temp_workspace, 'test.txt', 'content')
+        action = OpenCodeReadAction(path=filepath)
         obs = run(executor.opencode_read(action))
-        assert obs.content.startswith('<file>')
-        assert obs.content.strip().endswith('</file>')
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '1: content\n\n'
+            '(End of file - total 1 lines)\n'
+            '</content>'
+        )
 
     def test_read_file_truncates_long_lines(self, executor, temp_workspace):
         """Long lines (3000+ chars) should be truncated.
@@ -277,14 +362,11 @@ class TestOpenCodeReadHandler:
         """
         long_line = 'x' * 3000
         create_test_file(temp_workspace, 'long_line.txt', long_line)
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'long_line.txt')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'long_line.txt'))
         obs = run(executor.opencode_read(action))
-        # Should contain the content but may be truncated
         assert isinstance(obs, CmdOutputObservation)
-        # Content should be present but line may be cut
-        assert 'xxx' in obs.content or long_line in obs.content
+        assert f'1: {"x" * 2000}... (line truncated to 2000 chars)' in obs.content
+        assert long_line not in obs.content
 
     def test_read_file_crlf_line_endings(self, executor, temp_workspace):
         """Files with CRLF line endings should be read correctly.
@@ -321,9 +403,7 @@ class TestOpenCodeReadHandler:
         From opencode read.test.ts.
         """
         create_test_file(temp_workspace, 'small.txt', 'hello world')
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'small.txt')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'small.txt'))
         obs = run(executor.opencode_read(action))
         assert 'hello world' in obs.content
         # Should contain end-of-file indicator
@@ -334,18 +414,26 @@ class TestOpenCodeReadHandler:
 
         From opencode read.test.ts.
         """
-        lines = '\n'.join(f'line{i}' for i in range(100))
-        create_test_file(temp_workspace, 'many.txt', lines)
+        lines = '\n'.join(f'line {i}' for i in range(1, 101))
+        filepath = create_test_file(temp_workspace, 'many.txt', lines)
         action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'many.txt'),
+            path=filepath,
             offset=10,
-            limit=5
+            limit=5,
         )
         obs = run(executor.opencode_read(action))
-        assert 'line10' in obs.content
-        assert 'line14' in obs.content
-        # line0 should not be present since we started at offset 10
-        assert 'line0' not in obs.content.split('line10')[0]
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '10: line 10\n'
+            '11: line 11\n'
+            '12: line 12\n'
+            '13: line 13\n'
+            '14: line 14\n\n'
+            '(Showing lines 10-14 of 100. Use offset=15 to continue.)\n'
+            '</content>'
+        )
 
     def test_read_file_flatbuffers_schema_as_text(self, executor, temp_workspace):
         """FlatBuffers schema files (.fbs) should be read as text, not binary.
@@ -361,9 +449,7 @@ class TestOpenCodeReadHandler:
             'root_type Monster;'
         )
         create_test_file(temp_workspace, 'schema.fbs', fbs_content)
-        action = OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'schema.fbs')
-        )
+        action = OpenCodeReadAction(path=os.path.join(temp_workspace, 'schema.fbs'))
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, CmdOutputObservation)
         assert 'namespace MyGame' in obs.content
@@ -411,6 +497,21 @@ class TestOpenCodeWriteHandler:
         with open(filepath) as f:
             assert f.read() == 'new content'
 
+    def test_write_preserves_existing_utf8_bom(self, executor, temp_workspace):
+        filepath = os.path.join(temp_workspace, 'bom.txt')
+        with open(filepath, 'wb') as target:
+            target.write(b'\xef\xbb\xbfold')
+
+        obs = run(
+            executor.opencode_write(
+                OpenCodeWriteAction(path=filepath, content='new content')
+            )
+        )
+
+        assert isinstance(obs, FileWriteObservation)
+        with open(filepath, 'rb') as target:
+            assert target.read() == b'\xef\xbb\xbfnew content'
+
     def test_write_empty_content(self, executor, temp_workspace):
         """Test writing empty content creates empty file."""
         filepath = os.path.join(temp_workspace, 'empty.txt')
@@ -431,7 +532,9 @@ class TestOpenCodeWriteHandler:
     def test_write_multiline_content(self, executor, temp_workspace):
         """Test that multiline content preserves line breaks."""
         filepath = os.path.join(temp_workspace, 'multiline.py')
-        content = 'def hello():\n    print("Hello")\n\ndef goodbye():\n    print("Bye")\n'
+        content = (
+            'def hello():\n    print("Hello")\n\ndef goodbye():\n    print("Bye")\n'
+        )
         action = OpenCodeWriteAction(path=filepath, content=content)
         obs = run(executor.opencode_write(action))
         with open(filepath) as f:
@@ -442,7 +545,7 @@ class TestOpenCodeWriteHandler:
         filepath = os.path.join(temp_workspace, 'test.txt')
         action = OpenCodeWriteAction(path=filepath, content='hello')
         obs = run(executor.opencode_write(action))
-        assert 'wrote' in obs.content.lower() or 'success' in obs.content.lower()
+        assert obs.content == 'Wrote file successfully.'
 
     def test_write_relative_path(self, executor, temp_workspace):
         """Test writing with a relative path resolved from cwd."""
@@ -474,11 +577,11 @@ class TestGlobHandler:
         assert 'utils.py' in obs.content
 
     def test_glob_finds_json_files(self, executor, temp_workspace):
-        """Test glob finds specific extension."""
+        """Glob returns absolute paths without an extra envelope."""
         create_test_structure(temp_workspace)
         action = GlobAction(pattern='*.json', path=temp_workspace)
         obs = run(executor.glob(action))
-        assert 'config.json' in obs.content
+        assert obs.content == os.path.join(temp_workspace, 'config.json')
 
     def test_glob_in_subdirectory(self, executor, temp_workspace):
         """Test glob searches in specific directory."""
@@ -493,19 +596,34 @@ class TestGlobHandler:
         create_test_structure(temp_workspace)
         action = GlobAction(pattern='*.nonexistent', path=temp_workspace)
         obs = run(executor.glob(action))
-        assert 'no files' in obs.content.lower()
+        assert obs.content == 'No files found'
 
-    def test_glob_result_sorting_by_mtime(self, executor, temp_workspace):
-        """Test that results are sorted by modification time (newest first)."""
-        import time
-        create_test_file(temp_workspace, 'old.py', 'old')
-        time.sleep(0.1)
-        create_test_file(temp_workspace, 'new.py', 'new')
+    def test_glob_preserves_rg_order_and_uses_exact_truncation_footer(
+        self, executor, temp_workspace
+    ):
+        """Glob does not apply the obsolete modification-time sort."""
+        relative_paths = ['z-last.py', 'a-first.py'] + [
+            f'file-{index:03}.py' for index in range(98)
+        ]
+        rg_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='\n'.join(relative_paths) + '\n',
+            stderr='',
+        )
         action = GlobAction(pattern='*.py', path=temp_workspace)
-        obs = run(executor.glob(action))
-        lines = [l for l in obs.content.strip().split('\n') if l.strip()]
-        # Newest first
-        assert 'new.py' in lines[0]
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=rg_result,
+        ):
+            obs = run(executor.glob(action))
+
+        absolute_paths = [os.path.join(temp_workspace, path) for path in relative_paths]
+        assert obs.content == (
+            '\n'.join(absolute_paths)
+            + '\n\n(Results are truncated: showing first 100 results. '
+            'Consider using a more specific path or pattern.)'
+        )
 
     def test_glob_nonexistent_path(self, executor, temp_workspace):
         """Test glob on nonexistent path returns error."""
@@ -526,8 +644,8 @@ class TestGlobHandler:
         assert 'root.py' in obs.content
         assert 'nested.py' in obs.content
 
-    def test_glob_auto_prepends_recursive(self, executor, temp_workspace):
-        """Test that patterns without / get **/ prepended for recursive search."""
+    def test_glob_basename_pattern_matches_recursively(self, executor, temp_workspace):
+        """Ripgrep basename globs match files below the search directory."""
         create_test_file(temp_workspace, 'sub/nested.py', '')
         action = GlobAction(pattern='*.py', path=temp_workspace)
         obs = run(executor.glob(action))
@@ -556,20 +674,64 @@ class TestGrepHandler:
         return _make_executor(temp_workspace, ['grep'])
 
     def test_grep_finds_pattern(self, executor, temp_workspace):
-        """Test grep finds pattern in files with file:line format."""
-        create_test_structure(temp_workspace)
+        """Grep groups exact line results below absolute file headings."""
+        records = [
+            {
+                'type': 'match',
+                'data': {
+                    'path': {'text': 'first.py'},
+                    'line_number': 2,
+                    'lines': {'text': 'def first():'},
+                },
+            },
+            {
+                'type': 'match',
+                'data': {
+                    'path': {'text': 'first.py'},
+                    'line_number': 7,
+                    'lines': {'text': 'def second():'},
+                },
+            },
+            {
+                'type': 'match',
+                'data': {
+                    'path': {'text': 'nested/third.py'},
+                    'line_number': 1,
+                    'lines': {'text': 'def third():'},
+                },
+            },
+        ]
+        rg_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='\n'.join(json.dumps(record) for record in records),
+            stderr='',
+        )
         action = GrepAction(pattern='def', path=temp_workspace)
-        obs = run(executor.grep(action))
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=rg_result,
+        ):
+            obs = run(executor.grep(action))
+
+        first = os.path.join(temp_workspace, 'first.py')
+        third = os.path.join(temp_workspace, 'nested', 'third.py')
         assert isinstance(obs, CmdOutputObservation)
-        assert 'def main' in obs.content
-        assert 'def helper' in obs.content
+        assert obs.content == (
+            'Found 3 matches\n'
+            f'{first}:\n'
+            '  Line 2: def first():\n'
+            '  Line 7: def second():\n\n'
+            f'{third}:\n'
+            '  Line 1: def third():'
+        )
 
     def test_grep_with_line_numbers(self, executor, temp_workspace):
         """Test grep output includes line numbers."""
-        create_test_file(temp_workspace, 'test.py', 'line1\nTARGET\nline3')
+        filepath = create_test_file(temp_workspace, 'test.py', 'line1\nTARGET\nline3')
         action = GrepAction(pattern='TARGET', path=temp_workspace)
         obs = run(executor.grep(action))
-        assert '2:TARGET' in obs.content or ':2:TARGET' in obs.content
+        assert obs.content == (f'Found 1 matches\n{filepath}:\n  Line 2: TARGET\n')
 
     def test_grep_with_include_filter(self, executor, temp_workspace):
         """Test grep with file type filter."""
@@ -585,7 +747,7 @@ class TestGrepHandler:
         create_test_file(temp_workspace, 'file.py', 'nothing here')
         action = GrepAction(pattern='NONEXISTENT_XYZ_PATTERN', path=temp_workspace)
         obs = run(executor.grep(action))
-        assert 'no matches' in obs.content.lower()
+        assert obs.content == 'No files found'
 
     def test_grep_regex_pattern(self, executor, temp_workspace):
         """Test grep with regex pattern."""
@@ -598,12 +760,10 @@ class TestGrepHandler:
 
     def test_grep_case_sensitive(self, executor, temp_workspace):
         """Test grep is case-sensitive by default."""
-        create_test_file(temp_workspace, 'case.txt', 'Hello\nhello\nHELLO')
+        filepath = create_test_file(temp_workspace, 'case.txt', 'Hello\nhello\nHELLO')
         action = GrepAction(pattern='hello', path=temp_workspace)
         obs = run(executor.grep(action))
-        lines = [l for l in obs.content.strip().split('\n') if 'case.txt' in l]
-        assert len(lines) == 1
-        assert 'hello' in lines[0]
+        assert obs.content == (f'Found 1 matches\n{filepath}:\n  Line 2: hello\n')
 
     def test_grep_nonexistent_path(self, executor, temp_workspace):
         """Test grep on nonexistent path returns error."""
@@ -614,8 +774,8 @@ class TestGrepHandler:
         assert isinstance(obs, ErrorObservation)
         assert 'not exist' in obs.content.lower()
 
-    def test_grep_include_auto_recursive(self, executor, temp_workspace):
-        """Test that include pattern gets **/ prepended for recursive search."""
+    def test_grep_basename_include_matches_recursively(self, executor, temp_workspace):
+        """Ripgrep basename includes apply throughout the search directory."""
         create_test_file(temp_workspace, 'root.py', 'DEEP')
         create_test_file(temp_workspace, 'sub/nested.py', 'DEEP')
         create_test_file(temp_workspace, 'sub/nested.txt', 'DEEP')
@@ -634,11 +794,17 @@ class TestGrepHandler:
 
     def test_grep_multiple_matches_in_file(self, executor, temp_workspace):
         """Test grep finds multiple matches in the same file."""
-        create_test_file(temp_workspace, 'multi.py', 'TODO first\nother\nTODO second')
+        filepath = create_test_file(
+            temp_workspace, 'multi.py', 'TODO first\nother\nTODO second'
+        )
         action = GrepAction(pattern='TODO', path=temp_workspace)
         obs = run(executor.grep(action))
-        lines = [l for l in obs.content.strip().split('\n') if 'TODO' in l]
-        assert len(lines) >= 2
+        assert obs.content == (
+            'Found 2 matches\n'
+            f'{filepath}:\n'
+            '  Line 1: TODO first\n\n'
+            '  Line 3: TODO second'
+        )
 
     def test_grep_crlf_line_endings(self, executor, temp_workspace):
         """Grep handles files with CRLF line endings.
@@ -672,31 +838,30 @@ class TestGrepHandler:
         assert len(match_lines) >= 3
 
     def test_grep_empty_result_message(self, executor, temp_workspace):
-        """No matches returns correct 'no matches' message.
+        """No matches returns OpenCode's exact empty-result body.
 
         From opencode grep.test.ts.
         """
         create_test_file(temp_workspace, 'test.txt', 'hello world')
-        action = GrepAction(
-            pattern='xyznonexistentpatternxyz123', path=temp_workspace
-        )
+        action = GrepAction(pattern='xyznonexistentpatternxyz123', path=temp_workspace)
         obs = run(executor.grep(action))
-        assert 'no matches' in obs.content.lower() or 'no files' in obs.content.lower()
+        assert obs.content == 'No files found'
 
     def test_grep_invalid_regex_returns_error(self, executor, temp_workspace):
         """Invalid regex pattern (unmatched paren) returns informative ErrorObservation.
 
-        Bug: 'write_records(' silently returned 'No matches found' because
-        grep -E exit code 2 was hidden by 2>/dev/null.
-        Fix: detect exit code 2 and return ErrorObservation with fix guidance.
+        Ripgrep's non-search-error exit code and stderr must not be converted to
+        the successful ``No files found`` body.
         """
-        create_test_file(temp_workspace, 'func.py', 'def write_records(data):\n    pass')
+        create_test_file(
+            temp_workspace, 'func.py', 'def write_records(data):\n    pass'
+        )
         action = GrepAction(pattern='write_records(', path=temp_workspace)
         obs = run(executor.grep(action))
         assert isinstance(obs, ErrorObservation), (
-            f"Expected ErrorObservation for invalid regex, got: {type(obs).__name__}: {obs.content}"
+            f'Expected ErrorObservation for invalid regex, got: {type(obs).__name__}: {obs.content}'
         )
-        assert 'invalid regex' in obs.content.lower() or 'escaped' in obs.content.lower()
+        assert 'regex parse error' in obs.content.lower()
 
     def test_grep_valid_regex_alternation_works(self, executor, temp_workspace):
         """Valid regex with alternation (|) should still work."""
@@ -722,23 +887,41 @@ class TestListDirHandler:
         return _make_executor(temp_workspace, ['list_dir'])
 
     def test_list_dir_finds_files(self, executor, temp_workspace):
-        """Test list_dir finds files and directories."""
+        """Legacy list_dir uses the read-directory body and immediate entries."""
         create_test_structure(temp_workspace)
         action = ListDirAction(path=temp_workspace)
         obs = run(executor.list_dir(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert 'main.py' in obs.content
-        assert 'utils.py' in obs.content
-        assert 'config.json' in obs.content
+        assert obs.content == (
+            f'<path>{temp_workspace}</path>\n'
+            '<type>directory</type>\n'
+            '<entries>\n'
+            '.gitignore\n'
+            'config.json\n'
+            'main.py\n'
+            'README.md\n'
+            'src/\n'
+            'tests/\n'
+            'utils.py\n\n'
+            '(7 entries)\n'
+            '</entries>'
+        )
 
-    def test_list_dir_shows_tree_structure(self, executor, temp_workspace):
-        """Test that listing builds a tree structure."""
+    def test_list_dir_does_not_recurse(self, executor, temp_workspace):
+        """Directory entries are immediate rather than a recursive tree."""
         create_test_file(temp_workspace, 'root.py', '')
         create_test_file(temp_workspace, 'src/core.py', '')
         action = ListDirAction(path=temp_workspace)
         obs = run(executor.list_dir(action))
-        assert 'root.py' in obs.content
-        assert 'core.py' in obs.content
+        assert obs.content == (
+            f'<path>{temp_workspace}</path>\n'
+            '<type>directory</type>\n'
+            '<entries>\n'
+            'root.py\n'
+            'src/\n\n'
+            '(2 entries)\n'
+            '</entries>'
+        )
 
     def test_list_dir_empty_directory(self, executor, temp_workspace):
         """Test listing an empty directory."""
@@ -747,6 +930,13 @@ class TestListDirHandler:
         action = ListDirAction(path=empty_dir)
         obs = run(executor.list_dir(action))
         assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == (
+            f'<path>{empty_dir}</path>\n'
+            '<type>directory</type>\n'
+            '<entries>\n\n\n'
+            '(0 entries)\n'
+            '</entries>'
+        )
 
     def test_list_dir_relative_path(self, executor, temp_workspace):
         """Test listing with a relative path."""
@@ -755,18 +945,35 @@ class TestListDirHandler:
         action = ListDirAction(path='mydir')
         obs = run(executor.list_dir(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert 'a.txt' in obs.content
+        mydir = os.path.join(temp_workspace, 'mydir')
+        assert obs.content == (
+            f'<path>{mydir}</path>\n'
+            '<type>directory</type>\n'
+            '<entries>\n'
+            'a.txt\n\n'
+            '(1 entries)\n'
+            '</entries>'
+        )
 
-    def test_list_dir_ignore_patterns(self, executor, temp_workspace):
-        """Test that default ignore patterns filter common dirs."""
+    def test_list_dir_lists_ignored_names_but_not_their_contents(
+        self, executor, temp_workspace
+    ):
+        """The legacy alias lists every immediate entry without ignore rules."""
         create_test_file(temp_workspace, 'main.py', '')
         create_test_file(temp_workspace, 'node_modules/pkg/index.js', '')
         create_test_file(temp_workspace, '__pycache__/module.pyc', '')
         action = ListDirAction(path=temp_workspace)
         obs = run(executor.list_dir(action))
-        assert 'main.py' in obs.content
-        # node_modules and __pycache__ should be ignored
-        assert 'node_modules' not in obs.content or 'module.pyc' not in obs.content
+        assert obs.content == (
+            f'<path>{temp_workspace}</path>\n'
+            '<type>directory</type>\n'
+            '<entries>\n'
+            '__pycache__/\n'
+            'main.py\n'
+            'node_modules/\n\n'
+            '(3 entries)\n'
+            '</entries>'
+        )
 
 
 # ==============================================================================
@@ -785,55 +992,108 @@ class TestTodoHandlers:
         """Test reading empty todo list."""
         action = TodoReadAction()
         obs = run(executor.todo_read(action))
-        assert '[]' in obs.content
+        assert obs.content == '[]'
+        assert obs.todos == []
 
     def test_todo_write_adds_items(self, executor):
-        """Test writing todo items."""
-        action = TodoWriteAction(todos=[
-            {'id': '1', 'title': 'First task', 'status': 'pending'},
-            {'id': '2', 'title': 'Second task', 'status': 'in_progress'},
-        ])
+        """Todo write echoes pretty, unescaped Unicode JSON."""
+        todos = [
+            {
+                'content': 'Review café ✅',
+                'status': 'pending',
+                'priority': 'high',
+            },
+            {
+                'content': 'Ship release',
+                'status': 'in_progress',
+                'priority': 'medium',
+            },
+        ]
+        action = TodoWriteAction(todos=todos)
         obs = run(executor.todo_write(action))
         assert obs.success is True
-        assert len(obs.todos) == 2
+        assert obs.todos == todos
+        assert obs.content == (
+            '[\n'
+            '  {\n'
+            '    "content": "Review café ✅",\n'
+            '    "status": "pending",\n'
+            '    "priority": "high"\n'
+            '  },\n'
+            '  {\n'
+            '    "content": "Ship release",\n'
+            '    "status": "in_progress",\n'
+            '    "priority": "medium"\n'
+            '  }\n'
+            ']'
+        )
 
     def test_todo_write_then_read(self, executor):
         """Test writing then reading todos."""
-        write_action = TodoWriteAction(todos=[
-            {'id': '1', 'title': 'Task', 'status': 'pending'},
-        ])
-        run(executor.todo_write(write_action))
+        todos = [
+            {'content': 'Task', 'status': 'pending', 'priority': 'low'},
+        ]
+        expected = json.dumps(todos, indent=2, ensure_ascii=False)
+        write_obs = run(executor.todo_write(TodoWriteAction(todos=todos)))
+        assert write_obs.content == expected
 
         read_action = TodoReadAction()
         obs = run(executor.todo_read(read_action))
-        assert 'Task' in obs.content
+        assert obs.content == expected
+        assert obs.todos == todos
 
-    def test_todo_write_updates_existing(self, executor):
-        """Test updating existing todo by id."""
-        write1 = TodoWriteAction(todos=[
-            {'id': '1', 'title': 'Task', 'status': 'pending'},
-        ])
+    def test_todo_write_uses_generic_opencode_truncation(self, executor):
+        todos = [{'id': index} for index in range(1_500)]
+        expected = json.dumps(todos, indent=2, ensure_ascii=False)
+
+        obs = run(executor.todo_write(TodoWriteAction(todos=todos)))
+
+        assert ' lines truncated...\n\n' in obs.content
+        path_prefix = 'Full output saved to: '
+        path_start = obs.content.index(path_prefix) + len(path_prefix)
+        path_end = obs.content.index('\n', path_start)
+        output_path = obs.content[path_start:path_end]
+        try:
+            with open(output_path, encoding='utf-8') as saved_output:
+                assert saved_output.read() == expected
+        finally:
+            os.unlink(output_path)
+
+    def test_todo_write_replaces_existing_state(self, executor):
+        """Each todo write replaces, rather than merges with, prior state."""
+        write1 = TodoWriteAction(
+            todos=[
+                {'content': 'Old task', 'status': 'pending', 'priority': 'low'},
+            ]
+        )
         run(executor.todo_write(write1))
 
-        write2 = TodoWriteAction(todos=[
-            {'id': '1', 'status': 'completed'},
-        ])
-        obs = run(executor.todo_write(write2))
+        replacement = [
+            {
+                'content': 'New task',
+                'status': 'completed',
+                'priority': 'high',
+            },
+        ]
+        obs = run(executor.todo_write(TodoWriteAction(todos=replacement)))
         assert obs.success is True
-        # Should have updated the existing item
-        found = [t for t in obs.todos if t.get('id') == '1']
-        assert len(found) == 1
-        assert found[0]['status'] == 'completed'
+        assert obs.todos == replacement
+        assert obs.content == json.dumps(replacement, indent=2, ensure_ascii=False)
 
-    def test_todo_write_adds_new_items_preserving_existing(self, executor):
-        """Test that new items are added without overwriting existing."""
-        run(executor.todo_write(TodoWriteAction(todos=[
-            {'id': '1', 'title': 'First', 'status': 'pending'},
-        ])))
-        obs = run(executor.todo_write(TodoWriteAction(todos=[
-            {'id': '2', 'title': 'Second', 'status': 'pending'},
-        ])))
-        assert len(obs.todos) == 2
+    def test_todo_write_empty_list_clears_existing(self, executor):
+        """Replacing with an empty list clears all retained todo state."""
+        run(
+            executor.todo_write(
+                TodoWriteAction(
+                    todos=[
+                        {'content': 'First', 'status': 'pending', 'priority': 'low'},
+                    ]
+                )
+            )
+        )
+        obs = run(executor.todo_write(TodoWriteAction(todos=[])))
+        assert obs.todos == []
+        assert obs.content == '[]'
 
 
 # ==============================================================================
@@ -850,9 +1110,11 @@ class TestQuestionHandler:
 
     def test_question_returns_questions(self, executor):
         """Test that question handler returns the questions."""
-        action = QuestionAction(questions=[
-            {'id': 'q1', 'text': 'What framework?', 'options': ['React', 'Vue']},
-        ])
+        action = QuestionAction(
+            questions=[
+                {'id': 'q1', 'text': 'What framework?', 'options': ['React', 'Vue']},
+            ]
+        )
         obs = run(executor.question(action))
         assert 'What framework?' in obs.content
 
@@ -867,9 +1129,16 @@ class TestOpenCodeIntegration:
 
     @pytest.fixture
     def executor(self, temp_workspace):
-        return _make_executor(temp_workspace, [
-            'opencode_read', 'opencode_write', 'glob', 'grep', 'list_dir',
-        ])
+        return _make_executor(
+            temp_workspace,
+            [
+                'opencode_read',
+                'opencode_write',
+                'glob',
+                'grep',
+                'list_dir',
+            ],
+        )
 
     def test_write_then_read(self, executor, temp_workspace):
         """Test full write then read workflow."""
@@ -881,26 +1150,38 @@ class TestOpenCodeIntegration:
 
         read_action = OpenCodeReadAction(path=filepath)
         obs = run(executor.opencode_read(read_action))
-        assert '00001| def hello():' in obs.content
+        assert obs.content == (
+            f'<path>{filepath}</path>\n'
+            '<type>file</type>\n'
+            '<content>\n'
+            '1: def hello():\n'
+            '2:     print("Hello")\n\n'
+            '(End of file - total 2 lines)\n'
+            '</content>'
+        )
 
     def test_write_then_glob(self, executor, temp_workspace):
         """Test write then glob to find the written file."""
         filepath = os.path.join(temp_workspace, 'written.py')
-        run(executor.opencode_write(OpenCodeWriteAction(
-            path=filepath, content='content'
-        )))
+        run(
+            executor.opencode_write(
+                OpenCodeWriteAction(path=filepath, content='content')
+            )
+        )
         obs = run(executor.glob(GlobAction(pattern='*.py', path=temp_workspace)))
         assert 'written.py' in obs.content
 
     def test_write_then_grep(self, executor, temp_workspace):
         """Test write then grep to find content."""
         filepath = os.path.join(temp_workspace, 'search.py')
-        run(executor.opencode_write(OpenCodeWriteAction(
-            path=filepath, content='UNIQUE_MARKER_XYZ'
-        )))
-        obs = run(executor.grep(GrepAction(
-            pattern='UNIQUE_MARKER_XYZ', path=temp_workspace
-        )))
+        run(
+            executor.opencode_write(
+                OpenCodeWriteAction(path=filepath, content='UNIQUE_MARKER_XYZ')
+            )
+        )
+        obs = run(
+            executor.grep(GrepAction(pattern='UNIQUE_MARKER_XYZ', path=temp_workspace))
+        )
         assert 'search.py' in obs.content
 
     def test_list_then_read(self, executor, temp_workspace):
@@ -909,9 +1190,11 @@ class TestOpenCodeIntegration:
         list_obs = run(executor.list_dir(ListDirAction(path=temp_workspace)))
         assert 'main.py' in list_obs.content
 
-        read_obs = run(executor.opencode_read(OpenCodeReadAction(
-            path=os.path.join(temp_workspace, 'main.py')
-        )))
+        read_obs = run(
+            executor.opencode_read(
+                OpenCodeReadAction(path=os.path.join(temp_workspace, 'main.py'))
+            )
+        )
         assert 'def main' in read_obs.content
 
 
@@ -928,7 +1211,7 @@ class TestRipgrepIntegration:
         """Check if ripgrep is available."""
         result = subprocess.run(['which', 'rg'], capture_output=True)
         if result.returncode != 0:
-            pytest.skip("ripgrep (rg) not available")
+            pytest.skip('ripgrep (rg) not available')
 
     @pytest.fixture
     def executor(self, temp_workspace):

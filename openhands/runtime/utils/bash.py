@@ -16,6 +16,7 @@ from openhands.events.action import CmdRunAction
 from openhands.events.observation import ErrorObservation
 from openhands.events.observation.commands import (
     CMD_OUTPUT_PS1_END,
+    MAX_CMD_OUTPUT_SIZE,
     CmdOutputMetadata,
     CmdOutputObservation,
 )
@@ -276,8 +277,27 @@ class BashCommandStatus(Enum):
     HARD_TIMEOUT = "hard_timeout"
 
 
-def _remove_command_prefix(command_output: str, command: str) -> str:
-    return command_output.lstrip().removeprefix(command.lstrip()).lstrip()
+def _remove_command_prefix(
+    command_output: str,
+    command: str,
+    *,
+    preserve_output_whitespace: bool = False,
+) -> str:
+    if not preserve_output_whitespace:
+        return command_output.lstrip().removeprefix(command.lstrip()).lstrip()
+
+    # A terminal echoes the submitted command before stdout. Remove only that
+    # exact echo and its line ending; leading whitespace in actual stdout is
+    # part of OpenCode's raw shell body.
+    candidate = command_output.lstrip('\r\n')
+    if not candidate.startswith(command):
+        return command_output
+    candidate = candidate[len(command) :]
+    if candidate.startswith('\r\n'):
+        return candidate[2:]
+    if candidate.startswith('\n'):
+        return candidate[1:]
+    return candidate
 
 
 class BashSession:
@@ -371,13 +391,20 @@ class BashSession:
             self.memory_monitor.stop()
         self.close()
 
-    def _get_pane_content(self) -> str:
+    def _get_pane_content(self, preserve_trailing: bool = False) -> str:
         """Capture the current pane content and update the buffer."""
+        capture_args = ['capture-pane', '-J']
+        if preserve_trailing:
+            # tmux strips trailing spaces unless capture-pane is given -N.
+            capture_args.append('-N')
+        capture_args.extend(('-pS', '-'))
         content = "\n".join(
             map(
                 # avoid double newlines
-                lambda line: line.rstrip(),
-                self.pane.cmd("capture-pane", "-J", "-pS", "-").stdout,
+                lambda line: (
+                    line.rstrip('\r\n') if preserve_trailing else line.rstrip()
+                ),
+                self.pane.cmd(*capture_args).stdout,
             )
         )
         return content
@@ -499,6 +526,7 @@ class BashSession:
         raw_command_output: str,
         metadata: CmdOutputMetadata,
         continue_prefix: str = "",
+        preserve_trailing: bool = False,
     ) -> str:
         """Get the command output with the previous command output removed.
 
@@ -507,6 +535,8 @@ class BashSession:
             raw_command_output: The raw output from the command.
             metadata: The metadata object to store prefix/suffix in.
             continue_prefix: The prefix to add to the command output if it's a continuation of the previous command.
+            preserve_trailing: Return trailing whitespace unchanged for tool
+                protocols whose output body is byte-for-byte significant.
         """
         # remove the previous command output from the new output if any
         if self.prev_output:
@@ -515,8 +545,12 @@ class BashSession:
         else:
             command_output = raw_command_output
         self.prev_output = raw_command_output  # update current command output anyway
-        command_output = _remove_command_prefix(command_output, command)
-        return command_output.rstrip()
+        command_output = _remove_command_prefix(
+            command_output,
+            command,
+            preserve_output_whitespace=preserve_trailing,
+        )
+        return command_output if preserve_trailing else command_output.rstrip()
 
     def _handle_completed_command(
         self,
@@ -524,6 +558,7 @@ class BashSession:
         pane_content: str,
         ps1_matches: list[re.Match],
         hidden: bool,
+        opencode_result: bool = False,
     ) -> CmdOutputObservation:
         is_special_key = self._is_special_key(command)
         assert len(ps1_matches) >= 1, (
@@ -565,6 +600,7 @@ class BashSession:
             command,
             raw_command_output,
             metadata,
+            preserve_trailing=opencode_result,
         )
         self.prev_status = BashCommandStatus.COMPLETED
         self.prev_output = ""  # Reset previous command output
@@ -574,6 +610,7 @@ class BashSession:
             command=command,
             metadata=metadata,
             hidden=hidden,
+            max_content_size=None if opencode_result else MAX_CMD_OUTPUT_SIZE,
         )
 
     def _handle_nochange_timeout_command(
@@ -581,6 +618,7 @@ class BashSession:
         command: str,
         pane_content: str,
         ps1_matches: list[re.Match],
+        opencode_result: bool = False,
     ) -> CmdOutputObservation:
         self.prev_status = BashCommandStatus.NO_CHANGE_TIMEOUT
         if len(ps1_matches) != 1:
@@ -601,11 +639,13 @@ class BashSession:
             raw_command_output,
             metadata,
             continue_prefix="[Below is the output of the previous command.]\n",
+            preserve_trailing=opencode_result,
         )
         return CmdOutputObservation(
             content=command_output,
             command=command,
             metadata=metadata,
+            max_content_size=None if opencode_result else MAX_CMD_OUTPUT_SIZE,
         )
 
     def _handle_hard_timeout_command(
@@ -614,6 +654,7 @@ class BashSession:
         pane_content: str,
         ps1_matches: list[re.Match],
         timeout: float,
+        opencode_result: bool = False,
     ) -> CmdOutputObservation:
         self.prev_status = BashCommandStatus.HARD_TIMEOUT
         if len(ps1_matches) != 1:
@@ -634,12 +675,14 @@ class BashSession:
             raw_command_output,
             metadata,
             continue_prefix="[Below is the output of the previous command.]\n",
+            preserve_trailing=opencode_result,
         )
 
         return CmdOutputObservation(
             command=command,
             content=command_output,
             metadata=metadata,
+            max_content_size=None if opencode_result else MAX_CMD_OUTPUT_SIZE,
         )
 
     def _ready_for_next_command(self) -> None:
@@ -694,6 +737,11 @@ class BashSession:
         logger.debug(f"RECEIVED ACTION: {action}")
         command = action.command.strip()
         is_input: bool = action.is_input
+        opencode_result = (
+            action.tool_call_metadata is not None
+            and getattr(action.tool_call_metadata, 'tool_result_format', None)
+            in {'opencode', 'codex'}
+        )
 
         print(f"COMMAND: {command}")
         print(f"IS INPUT: {is_input}")
@@ -751,7 +799,9 @@ class BashSession:
                 )
 
         # Get initial state before sending command
-        initial_pane_output = self._get_pane_content()
+        initial_pane_output = self._get_pane_content(
+            preserve_trailing=opencode_result
+        )
         initial_ps1_matches = CmdOutputMetadata.matches_ps1_metadata(
             initial_pane_output
         )
@@ -799,12 +849,14 @@ class BashSession:
                 raw_command_output,
                 metadata,
                 continue_prefix="[Below is the output of the previous command.]\n",
+                preserve_trailing=opencode_result,
             )
             return CmdOutputObservation(
                 command=command,
                 content=command_output,
                 metadata=metadata,
                 hidden=getattr(action, "hidden", False),
+                max_content_size=None if opencode_result else MAX_CMD_OUTPUT_SIZE,
             )
 
         # Send actual command/inputs to the pane
@@ -836,7 +888,9 @@ class BashSession:
         while should_continue():
             _start_time = time.time()
             logger.debug(f"GETTING PANE CONTENT at {_start_time}")
-            cur_pane_output = self._get_pane_content()
+            cur_pane_output = self._get_pane_content(
+                preserve_trailing=opencode_result
+            )
             logger.debug(
                 f"PANE CONTENT GOT after {time.time() - _start_time:.2f} seconds"
             )
@@ -867,6 +921,7 @@ class BashSession:
                     pane_content=cur_pane_output,
                     ps1_matches=ps1_matches,
                     hidden=getattr(action, "hidden", False),
+                    opencode_result=opencode_result,
                 )
 
             # Timeout checks should only trigger if a new prompt hasn't appeared yet.
@@ -914,6 +969,7 @@ class BashSession:
                     command,
                     pane_content=cur_pane_output,
                     ps1_matches=ps1_matches,
+                    opencode_result=opencode_result,
                 )
 
             # 3) Execution timed out due to hard timeout
@@ -928,6 +984,7 @@ class BashSession:
                     pane_content=cur_pane_output,
                     ps1_matches=ps1_matches,
                     timeout=action.timeout,
+                    opencode_result=opencode_result,
                 )
 
             logger.debug(f"SLEEPING for {self.POLL_INTERVAL} seconds for next poll")

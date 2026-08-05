@@ -11,10 +11,6 @@ Tests run against the actual runtime (Docker/Local/CLI) to ensure
 proper execution of file operations.
 """
 
-import os
-import time
-from pathlib import Path
-
 import pytest
 from conftest import _close_test_runtime, _load_runtime
 
@@ -78,6 +74,30 @@ def _create_test_directory_structure(runtime, base_path: str):
     return files
 
 
+def _expected_file_read(
+    path: str,
+    lines: list[tuple[int, str]],
+    footer: str,
+) -> str:
+    """Build the exact model-visible OpenCode read body."""
+    numbered = '\n'.join(f'{number}: {line}' for number, line in lines)
+    return (
+        f'<path>{path}</path>\n'
+        '<type>file</type>\n'
+        f'<content>\n{numbered}\n\n{footer}\n</content>'
+    )
+
+
+def _expected_directory_read(path: str, entries: list[str]) -> str:
+    """Build the exact model-visible OpenCode directory body."""
+    listing = '\n'.join(entries)
+    return (
+        f'<path>{path}</path>\n'
+        '<type>directory</type>\n'
+        f'<entries>\n{listing}\n\n({len(entries)} entries)\n</entries>'
+    )
+
+
 # ==============================================================================
 # OpenCodeReadAction Tests
 # ==============================================================================
@@ -101,12 +121,11 @@ class TestOpenCodeRead:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            assert '<file>' in obs.content
-            assert '</file>' in obs.content
-            # Check line number format (5-digit zero-padded with |)
-            assert '00001| line 1' in obs.content
-            assert '00002| line 2' in obs.content
-            assert '00005| line 5' in obs.content
+            assert obs.content == _expected_file_read(
+                f'{sandbox_path}/test.txt',
+                [(number, f'line {number}') for number in range(1, 6)],
+                '(End of file - total 5 lines)',
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -118,16 +137,42 @@ class TestOpenCodeRead:
             test_content = '\n'.join([f'line {i}' for i in range(1, 21)])
             _create_test_file(runtime, f'{sandbox_path}/offset_test.txt', test_content)
 
-            # Read starting from line 10 (0-based offset 9)
-            action = OpenCodeReadAction(path=f'{sandbox_path}/offset_test.txt', offset=9)
+            # OpenCode offsets are one-based, so offset=10 starts at line 10.
+            action = OpenCodeReadAction(
+                path=f'{sandbox_path}/offset_test.txt', offset=10
+            )
             action.set_hard_timeout(30)
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should start from line 10 (offset 9 + 1 = line 10)
-            assert '00010| line 10' in obs.content
-            # Should NOT contain early lines
-            assert '00001| line 1' not in obs.content
+            assert obs.content == _expected_file_read(
+                f'{sandbox_path}/offset_test.txt',
+                [(number, f'line {number}') for number in range(10, 21)],
+                '(End of file - total 20 lines)',
+            )
+
+            # JavaScript's `offset || 1` makes zero an alias for the first line.
+            zero_action = OpenCodeReadAction(
+                path=f'{sandbox_path}/offset_test.txt', offset=0, limit=1
+            )
+            zero_action.set_hard_timeout(30)
+            zero_obs = _run_action(runtime, zero_action)
+            assert isinstance(zero_obs, CmdOutputObservation)
+            assert zero_obs.content == _expected_file_read(
+                f'{sandbox_path}/offset_test.txt',
+                [(1, 'line 1')],
+                '(Showing lines 1-1 of 20. Use offset=2 to continue.)',
+            )
+
+            out_of_range = OpenCodeReadAction(
+                path=f'{sandbox_path}/offset_test.txt', offset=21
+            )
+            out_of_range.set_hard_timeout(30)
+            error = _run_action(runtime, out_of_range)
+            assert isinstance(error, ErrorObservation)
+            assert error.content == (
+                'Offset 21 is out of range for this file (20 lines)'
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -145,10 +190,11 @@ class TestOpenCodeRead:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            assert '00001| line 1' in obs.content
-            assert '00005| line 5' in obs.content
-            # Should indicate there are more lines
-            assert 'more lines' in obs.content.lower() or 'offset' in obs.content.lower()
+            assert obs.content == _expected_file_read(
+                f'{sandbox_path}/limit_test.txt',
+                [(number, f'line {number}') for number in range(1, 6)],
+                '(Showing lines 1-5 of 100. Use offset=6 to continue.)',
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -160,14 +206,16 @@ class TestOpenCodeRead:
             # Create a similar file for suggestions
             _create_test_file(runtime, f'{sandbox_path}/existing_file.py', 'content')
 
-            action = OpenCodeReadAction(path=f'{sandbox_path}/existing_file.txt')
+            action = OpenCodeReadAction(path=f'{sandbox_path}/existing_file')
             action.set_hard_timeout(30)
             obs = _run_action(runtime, action)
 
-            # Should be error or contain error message
-            assert isinstance(obs, (ErrorObservation, CmdOutputObservation))
-            content = obs.content if hasattr(obs, 'content') else str(obs)
-            assert 'not found' in content.lower() or 'error' in content.lower()
+            assert isinstance(obs, ErrorObservation)
+            assert obs.content == (
+                f'File not found: {sandbox_path}/existing_file\n\n'
+                'Did you mean one of these?\n'
+                f'{sandbox_path}/existing_file.py'
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -186,7 +234,11 @@ class TestOpenCodeRead:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            assert '<file>' in obs.content
+            assert obs.content == _expected_file_read(
+                f'{sandbox_path}/empty.txt',
+                [],
+                '(End of file - total 0 lines)',
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -195,8 +247,8 @@ class TestOpenCodeRead:
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
-            # Create file with very long line (> 2000 chars)
-            long_line = 'x' * 3000
+            # OpenCode keeps exactly 2,000 characters, then adds this suffix.
+            long_line = 'x' * 2001
             _create_test_file(runtime, f'{sandbox_path}/long_line.txt', long_line)
 
             action = OpenCodeReadAction(path=f'{sandbox_path}/long_line.txt')
@@ -204,8 +256,34 @@ class TestOpenCodeRead:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Line should be truncated with ...
-            assert '...' in obs.content
+            shown = 'x' * 2000 + '... (line truncated to 2000 chars)'
+            assert obs.content == _expected_file_read(
+                f'{sandbox_path}/long_line.txt',
+                [(1, shown)],
+                '(End of file - total 1 lines)',
+            )
+        finally:
+            _close_test_runtime(runtime)
+
+    def test_read_directory_uses_directory_body(
+        self, temp_dir, runtime_cls, run_as_openhands
+    ):
+        """Test read's directory branch uses OpenCode's immediate-entry body."""
+        runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
+        try:
+            sandbox_path = config.workspace_mount_path_in_sandbox
+            directory = f'{sandbox_path}/read_directory'
+            _create_test_file(runtime, f'{directory}/z.txt', 'z')
+            _create_test_file(runtime, f'{directory}/nested/a.txt', 'a')
+
+            action = OpenCodeReadAction(path=directory)
+            action.set_hard_timeout(30)
+            obs = _run_action(runtime, action)
+
+            assert isinstance(obs, CmdOutputObservation)
+            assert obs.content == _expected_directory_read(
+                directory, ['nested/', 'z.txt']
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -233,7 +311,7 @@ class TestOpenCodeWrite:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, FileWriteObservation)
-            assert 'success' in obs.content.lower() or obs.path.endswith('new_file.py')
+            assert obs.content == 'Wrote file successfully.'
 
             # Verify file exists with correct content
             verify = CmdRunAction(command=f'cat {sandbox_path}/new_file.py')
@@ -258,6 +336,7 @@ class TestOpenCodeWrite:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, FileWriteObservation)
+            assert obs.content == 'Wrote file successfully.'
 
             # Verify directory was created
             verify = CmdRunAction(command=f'test -f {nested_path} && echo "exists"')
@@ -283,6 +362,7 @@ class TestOpenCodeWrite:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, FileWriteObservation)
+            assert obs.content == 'Wrote file successfully.'
 
             # Verify content was overwritten
             verify = CmdRunAction(command=f'cat {sandbox_path}/overwrite.txt')
@@ -307,6 +387,7 @@ class TestOpenCodeWrite:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, FileWriteObservation)
+            assert obs.content == 'Wrote file successfully.'
 
             # Verify file is empty
             verify = CmdRunAction(command=f'wc -c < {sandbox_path}/empty_write.txt')
@@ -331,6 +412,7 @@ class TestOpenCodeWrite:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, FileWriteObservation)
+            assert obs.content == 'Wrote file successfully.'
 
             # Verify line count
             verify = CmdRunAction(command=f'wc -l < {sandbox_path}/multiline.txt')
@@ -341,8 +423,10 @@ class TestOpenCodeWrite:
         finally:
             _close_test_runtime(runtime)
 
-    def test_write_python_with_linting(self, temp_dir, runtime_cls, run_as_openhands):
-        """Test writing Python file shows lint errors."""
+    def test_write_python_without_lsp_diagnostics(
+        self, temp_dir, runtime_cls, run_as_openhands
+    ):
+        """Test writing Python returns only the base body without an LSP."""
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
@@ -358,7 +442,7 @@ class TestOpenCodeWrite:
 
             # File should still be written
             assert isinstance(obs, FileWriteObservation)
-            # May or may not show diagnostics depending on linter availability
+            assert obs.content == 'Wrote file successfully.'
         finally:
             _close_test_runtime(runtime)
 
@@ -376,18 +460,16 @@ class TestGlob:
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
-            _create_test_directory_structure(runtime, sandbox_path)
+            files = _create_test_directory_structure(runtime, sandbox_path)
 
             action = GlobAction(pattern='*.py', path=sandbox_path)
             action.set_hard_timeout(30)
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find Python files
-            assert '.py' in obs.content
-            # Should find at least some of our test files
-            content_lower = obs.content.lower()
-            assert 'main.py' in content_lower or 'utils.py' in content_lower
+            assert set(obs.content.splitlines()) == {
+                path for path in files if path.endswith('.py')
+            }
         finally:
             _close_test_runtime(runtime)
 
@@ -396,15 +478,16 @@ class TestGlob:
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
-            _create_test_directory_structure(runtime, sandbox_path)
+            files = _create_test_directory_structure(runtime, sandbox_path)
 
             action = GlobAction(pattern='**/*.py', path=sandbox_path)
             action.set_hard_timeout(30)
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find files in subdirectories
-            assert 'test_' in obs.content.lower() or 'core.py' in obs.content.lower()
+            assert set(obs.content.splitlines()) == {
+                path for path in files if path.endswith('.py')
+            }
         finally:
             _close_test_runtime(runtime)
 
@@ -421,8 +504,7 @@ class TestGlob:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should indicate no files found
-            assert 'no files' in obs.content.lower() or obs.content.strip() == ''
+            assert obs.content == 'No files found'
         finally:
             _close_test_runtime(runtime)
 
@@ -438,9 +520,7 @@ class TestGlob:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            assert 'config.json' in obs.content
-            # Should NOT find Python files
-            assert 'main.py' not in obs.content
+            assert obs.content == f'{sandbox_path}/config.json'
         finally:
             _close_test_runtime(runtime)
 
@@ -457,10 +537,45 @@ class TestGlob:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find test files
-            assert 'test_' in obs.content.lower()
-            # Should NOT find src files
-            assert 'main.py' not in obs.content
+            assert set(obs.content.splitlines()) == {
+                f'{sandbox_path}/tests/test_main.py',
+                f'{sandbox_path}/tests/test_utils.py',
+            }
+        finally:
+            _close_test_runtime(runtime)
+
+    def test_glob_exactly_100_results_has_truncation_footer(
+        self, temp_dir, runtime_cls, run_as_openhands
+    ):
+        """Test OpenCode's inclusive 100-result truncation boundary."""
+        runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
+        try:
+            sandbox_path = config.workspace_mount_path_in_sandbox
+            directory = f'{sandbox_path}/glob_boundary'
+            create = CmdRunAction(
+                command=(
+                    f'mkdir -p "{directory}" && '
+                    f'touch "{directory}"/file-{{000..099}}.py'
+                )
+            )
+            create.set_hard_timeout(30)
+            create_obs = runtime.run_action(create)
+            assert isinstance(create_obs, CmdOutputObservation)
+            assert create_obs.exit_code == 0
+
+            action = GlobAction(pattern='*.py', path=directory)
+            action.set_hard_timeout(30)
+            obs = _run_action(runtime, action)
+
+            assert isinstance(obs, CmdOutputObservation)
+            listing, footer = obs.content.rsplit('\n\n', maxsplit=1)
+            assert set(listing.splitlines()) == {
+                f'{directory}/file-{index:03}.py' for index in range(100)
+            }
+            assert footer == (
+                '(Results are truncated: showing first 100 results. '
+                'Consider using a more specific path or pattern.)'
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -485,10 +600,17 @@ class TestGrep:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find function definitions
-            assert 'def' in obs.content
-            # Should show line numbers
-            assert ':' in obs.content  # file:linenum:content format
+            assert obs.content.startswith('Found 4 matches\n')
+            assert f'{sandbox_path}/src/main.py:\n  Line 1: def main():\n' in obs.content
+            assert f'{sandbox_path}/src/utils.py:\n  Line 2: def helper():\n' in obs.content
+            assert (
+                f'{sandbox_path}/tests/test_main.py:\n'
+                '  Line 3: def test_main():\n'
+            ) in obs.content
+            assert (
+                f'{sandbox_path}/tests/test_utils.py:\n'
+                '  Line 1: def test_helper():\n'
+            ) in obs.content
         finally:
             _close_test_runtime(runtime)
 
@@ -505,9 +627,11 @@ class TestGrep:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find imports in Python files
-            if 'import' in obs.content:
-                assert '.py' in obs.content
+            assert obs.content == (
+                'Found 1 matches\n'
+                f'{sandbox_path}/tests/test_main.py:\n'
+                '  Line 1: import pytest\n'
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -523,8 +647,7 @@ class TestGrep:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should indicate no matches
-            assert 'no match' in obs.content.lower() or obs.content.strip() == ''
+            assert obs.content == 'No files found'
         finally:
             _close_test_runtime(runtime)
 
@@ -541,8 +664,8 @@ class TestGrep:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find function definitions
-            assert 'def' in obs.content
+            assert obs.content.startswith('Found 4 matches\n')
+            assert obs.content.count('  Line ') == 4
         finally:
             _close_test_runtime(runtime)
 
@@ -563,13 +686,16 @@ class TestGrep:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should find lowercase
-            assert 'hello' in obs.content.lower()
+            assert obs.content == (
+                'Found 1 matches\n'
+                f'{sandbox_path}/case_test.txt:\n'
+                '  Line 2: hello\n'
+            )
         finally:
             _close_test_runtime(runtime)
 
     def test_grep_multiline_context(self, temp_dir, runtime_cls, run_as_openhands):
-        """Test grep shows file:line:content format."""
+        """Test grep shows OpenCode's grouped path and line format."""
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
@@ -581,9 +707,40 @@ class TestGrep:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            assert 'TARGET_PATTERN' in obs.content
-            # Should show line number (line 2)
-            assert '2' in obs.content or 'grep_test.txt' in obs.content
+            assert obs.content == (
+                'Found 1 matches\n'
+                f'{sandbox_path}/grep_test.txt:\n'
+                '  Line 2: TARGET_PATTERN\n'
+            )
+        finally:
+            _close_test_runtime(runtime)
+
+    def test_grep_exactly_100_matches_has_truncation_markers(
+        self, temp_dir, runtime_cls, run_as_openhands
+    ):
+        """Test OpenCode's inclusive 100-match truncation boundary."""
+        runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
+        try:
+            sandbox_path = config.workspace_mount_path_in_sandbox
+            path = f'{sandbox_path}/grep_boundary.txt'
+            content = '\n'.join(f'MATCH {index:03}' for index in range(1, 101))
+            _create_test_file(runtime, path, content)
+
+            action = GrepAction(pattern='MATCH', path=path)
+            action.set_hard_timeout(30)
+            obs = _run_action(runtime, action)
+
+            assert isinstance(obs, CmdOutputObservation)
+            assert obs.content.startswith(
+                f'Found 100 matches (more matches available)\n{path}:\n'
+            )
+            assert obs.content.count('  Line ') == 100
+            assert '  Line 1: MATCH 001\n' in obs.content
+            assert '  Line 100: MATCH 100\n' in obs.content
+            assert obs.content.endswith(
+                '\n\n\n'
+                '(Results truncated. Consider using a more specific path or pattern.)'
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -608,25 +765,30 @@ class TestListDir:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should show directory structure
-            assert 'src' in obs.content or 'tests' in obs.content or 'docs' in obs.content
+            assert obs.content == _expected_directory_read(
+                sandbox_path,
+                ['.gitignore', 'config.json', 'docs/', 'src/', 'tests/'],
+            )
         finally:
             _close_test_runtime(runtime)
 
-    def test_list_dir_default_ignores(self, temp_dir, runtime_cls, run_as_openhands):
-        """Test default ignore patterns are applied."""
+    def test_list_dir_lists_all_immediate_entries(
+        self, temp_dir, runtime_cls, run_as_openhands
+    ):
+        """Test the legacy alias follows OpenCode read-directory semantics."""
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
 
-            # Create directories that should be ignored
-            ignored_dirs = [
+            # Directory reads expose every immediate entry, including names that
+            # search tools commonly ignore.
+            entries = [
                 f'{sandbox_path}/node_modules/package/index.js',
                 f'{sandbox_path}/__pycache__/module.pyc',
                 f'{sandbox_path}/.git/config',
-                f'{sandbox_path}/src/main.py',  # This should show
+                f'{sandbox_path}/src/main.py',
             ]
-            for path in ignored_dirs:
+            for path in entries:
                 _create_test_file(runtime, path, 'content')
 
             action = ListDirAction(path=sandbox_path)
@@ -634,14 +796,17 @@ class TestListDir:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Main.py should be visible
-            # node_modules, __pycache__, .git should be filtered
-            # (behavior may vary based on tool availability)
+            assert obs.content == _expected_directory_read(
+                sandbox_path,
+                ['.git/', '__pycache__/', 'node_modules/', 'src/'],
+            )
         finally:
             _close_test_runtime(runtime)
 
-    def test_list_dir_with_custom_ignore(self, temp_dir, runtime_cls, run_as_openhands):
-        """Test custom ignore patterns."""
+    def test_list_dir_legacy_ignore_does_not_change_body(
+        self, temp_dir, runtime_cls, run_as_openhands
+    ):
+        """Test retained legacy arguments do not alter OpenCode's read body."""
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
@@ -653,8 +818,10 @@ class TestListDir:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should show src but potentially not tests
-            assert 'src' in obs.content or 'main.py' in obs.content
+            assert obs.content == _expected_directory_read(
+                sandbox_path,
+                ['.gitignore', 'config.json', 'docs/', 'src/', 'tests/'],
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -675,12 +842,12 @@ class TestListDir:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should handle empty directory gracefully
+            assert obs.content == _expected_directory_read(empty_dir, [])
         finally:
             _close_test_runtime(runtime)
 
     def test_list_dir_nested_structure(self, temp_dir, runtime_cls, run_as_openhands):
-        """Test listing shows nested directory structure."""
+        """Test listing reports immediate entries, not a recursive tree."""
         runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
         try:
             sandbox_path = config.workspace_mount_path_in_sandbox
@@ -691,9 +858,10 @@ class TestListDir:
             obs = _run_action(runtime, action)
 
             assert isinstance(obs, CmdOutputObservation)
-            # Should show directory hierarchy
-            # The exact format depends on the tool used (tree vs find)
-            assert len(obs.content) > 0
+            assert obs.content == _expected_directory_read(
+                sandbox_path,
+                ['.gitignore', 'config.json', 'docs/', 'src/', 'tests/'],
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -707,8 +875,8 @@ class TestListDir:
             action.set_hard_timeout(30)
             obs = _run_action(runtime, action)
 
-            # Should handle gracefully (either error or empty output)
-            assert isinstance(obs, (CmdOutputObservation, ErrorObservation))
+            assert isinstance(obs, ErrorObservation)
+            assert obs.content == f'File not found: {sandbox_path}/nonexistent_dir_12345'
         finally:
             _close_test_runtime(runtime)
 
@@ -736,6 +904,7 @@ class TestCombinedWorkflows:
             write_action.set_hard_timeout(30)
             write_obs = _run_action(runtime, write_action)
             assert isinstance(write_obs, FileWriteObservation)
+            assert write_obs.content == 'Wrote file successfully.'
 
             # Read file back
             read_action = OpenCodeReadAction(path=f'{sandbox_path}/workflow_test.py')
@@ -743,8 +912,16 @@ class TestCombinedWorkflows:
             read_obs = _run_action(runtime, read_action)
 
             assert isinstance(read_obs, CmdOutputObservation)
-            assert 'def hello()' in read_obs.content
-            assert 'print' in read_obs.content
+            assert read_obs.content == _expected_file_read(
+                f'{sandbox_path}/workflow_test.py',
+                [
+                    (1, 'def hello():'),
+                    (2, '    print("Hello!")'),
+                    (3, ''),
+                    (4, 'hello()'),
+                ],
+                '(End of file - total 4 lines)',
+            )
         finally:
             _close_test_runtime(runtime)
 
@@ -761,7 +938,11 @@ class TestCombinedWorkflows:
             glob_obs = _run_action(runtime, glob_action)
 
             assert isinstance(glob_obs, CmdOutputObservation)
-            assert '.py' in glob_obs.content
+            assert set(glob_obs.content.splitlines()) == {
+                f'{sandbox_path}/src/main.py',
+                f'{sandbox_path}/src/utils.py',
+                f'{sandbox_path}/src/lib/core.py',
+            }
         finally:
             _close_test_runtime(runtime)
 
@@ -778,9 +959,10 @@ class TestCombinedWorkflows:
             grep_obs = _run_action(runtime, grep_action)
 
             assert isinstance(grep_obs, CmdOutputObservation)
-            # Should find Core class
-            if 'class' in grep_obs.content:
-                assert 'Core' in grep_obs.content
+            assert grep_obs.content == (
+                'Found 1 matches\n'
+                f'{sandbox_path}/src/lib/core.py:\n'
+                '  Line 1: class Core:\n'
+            )
         finally:
             _close_test_runtime(runtime)
-

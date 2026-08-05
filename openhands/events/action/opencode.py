@@ -20,7 +20,7 @@ class OpenCodeReadAction(Action):
     """Reads a file with OpenCode-style formatting.
 
     Features:
-    - 5-digit zero-padded line numbers with | separator (e.g., "00001| content")
+    - OpenCode XML-like file/directory result bodies
     - Binary file detection (by extension and content analysis)
     - 50KB byte limit with truncation messages
     - File suggestions when file not found
@@ -28,12 +28,12 @@ class OpenCodeReadAction(Action):
 
     Attributes:
         path: The path to the file to read
-        offset: Line number to start reading from (0-based). Default: 0
+        offset: Line number to start reading from (1-based). Default: 1
         limit: Number of lines to read. Default: 2000
     """
 
     path: str
-    offset: int = 0
+    offset: int = 1
     limit: int = 2000
     thought: str = ""
     action: str = ActionType.OPENCODE_READ
@@ -42,8 +42,8 @@ class OpenCodeReadAction(Action):
 
     @property
     def message(self) -> str:
-        if self.offset > 0:
-            return f"Reading file: {self.path} (from line {self.offset + 1})"
+        if self.offset > 1:
+            return f"Reading file: {self.path} (from line {self.offset})"
         return f"Reading file: {self.path}"
 
 

@@ -113,6 +113,8 @@ class FileEditAction(Action):
     runnable: ClassVar[bool] = True
     security_risk: ActionSecurityRisk = ActionSecurityRisk.UNKNOWN
     impl_source: FileEditSource = FileEditSource.OH_ACI
+    # Appended to preserve the positional constructor ABI of legacy callers.
+    replace_all: bool = False
 
     def __repr__(self) -> str:
         ret = '**FileEditAction**\n'

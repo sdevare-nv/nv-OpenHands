@@ -270,6 +270,39 @@ class TestMessagesToReplayEventsCodeAct:
 
 
 class TestMessagesToReplayEventsEdgeCases:
+    @pytest.mark.parametrize('agent_class', ['OpenCodeAgent', 'CodexAgent'])
+    def test_no_tool_call_stops_opencode_and_codex(self, agent_class):
+        messages = [
+            _user_msg('Fix the bug'),
+            _assistant_msg('The task is complete.'),
+            _user_msg('Please continue'),
+            _assistant_tool_call(
+                None,
+                [_tool_call('nonexistent_tool', {})],
+            ),
+        ]
+
+        events, initial = messages_to_replay_events(messages, agent_class)
+
+        assert initial.content == 'Fix the bug'
+        assert len(events) == 1
+        assert isinstance(events[0], AgentFinishAction)
+        assert events[0].final_thought == 'The task is complete.'
+        assert events[0].thought == 'The task is complete.'
+
+    @pytest.mark.parametrize('agent_class', ['OpenCodeAgent', 'CodexAgent'])
+    def test_empty_no_tool_call_stops_opencode_and_codex(self, agent_class):
+        messages = [
+            _user_msg('Fix the bug'),
+            _assistant_msg(''),
+        ]
+
+        events, _ = messages_to_replay_events(messages, agent_class)
+
+        assert len(events) == 1
+        assert isinstance(events[0], AgentFinishAction)
+        assert events[0].final_thought == ''
+
     def test_no_user_message_raises(self):
         messages = [
             _system_msg(),

@@ -101,149 +101,145 @@ def create_test_structure(base_dir: str) -> dict:
 
 
 class TestCodexReadFileHandler:
-    """Tests for the codex_read_file handler calling the actual handler method."""
+    """Exact rust-v0.98.0 ``read_file`` handler contract tests."""
 
     @pytest.fixture
     def executor(self, temp_workspace):
         from openhands.runtime.action_execution_server import ActionExecutor
+
         executor = MagicMock(spec=ActionExecutor)
         executor.bash_session = MagicMock()
         executor.bash_session.cwd = temp_workspace
-        executor._resolve_path = ActionExecutor._resolve_path.__get__(executor).__get__(executor)
+        executor._resolve_path = ActionExecutor._resolve_path.__get__(executor)
         executor.codex_read_file = ActionExecutor.codex_read_file.__get__(executor)
         executor._codex_read_file_indentation = ActionExecutor._codex_read_file_indentation.__get__(executor)
         return executor
 
-    def test_read_file_line_format_is_1_indexed(self, executor, temp_workspace):
-        """Test that lines are formatted as L{number}: (1-indexed)."""
-        create_test_file(temp_workspace, 'test.txt', 'line 1\nline 2\nline 3')
-        action = CodexReadFileAction(file_path=os.path.join(temp_workspace, 'test.txt'))
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'L1: line 1' in obs.content
-        assert 'L2: line 2' in obs.content
-        assert 'L3: line 3' in obs.content
+    @staticmethod
+    def run(executor, action):
+        return asyncio.run(executor.codex_read_file(action))
 
-    def test_read_file_with_offset(self, executor, temp_workspace):
-        """Test reading file from a specific 1-indexed offset."""
-        content = '\n'.join([f'line {i}' for i in range(1, 101)])
-        create_test_file(temp_workspace, 'test.txt', content)
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'test.txt'), offset=50, limit=5
+    def test_slice_body_is_exact_and_has_no_footer(
+        self, executor, temp_workspace
+    ):
+        path = create_test_file(
+            temp_workspace, 'range.txt', 'alpha\nbeta\ngamma\ndelta\n'
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'L50: line 50' in obs.content
-        assert 'L54: line 54' in obs.content
-        assert 'L55:' not in obs.content  # Only 5 lines
 
-    def test_read_file_with_limit(self, executor, temp_workspace):
-        """Test reading file with line limit."""
-        content = '\n'.join([f'line {i}' for i in range(1, 101)])
-        create_test_file(temp_workspace, 'test.txt', content)
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'test.txt'), limit=3
+        obs = self.run(
+            executor,
+            CodexReadFileAction(file_path=path, offset=2, limit=2),
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'L1: line 1' in obs.content
-        assert 'L3: line 3' in obs.content
-        assert 'L4:' not in obs.content
-        assert 'has more' in obs.content.lower() or 'total' in obs.content.lower()
 
-    def test_read_nonexistent_file(self, executor, temp_workspace):
-        """Test reading a file that doesn't exist returns error."""
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'nonexistent.py')
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'not found' in obs.content.lower()
-
-    def test_read_binary_file_detection(self, executor, temp_workspace):
-        """Test binary file detection returns error."""
-        binary_path = os.path.join(temp_workspace, 'binary.dat')
-        with open(binary_path, 'wb') as f:
-            f.write(b'\x00\x01\x02\x03\x04\x05')
-        action = CodexReadFileAction(file_path=binary_path)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'binary' in obs.content.lower()
-
-    def test_read_text_file_not_binary(self, executor, temp_workspace):
-        """Test that text files are read normally."""
-        create_test_file(temp_workspace, 'text.py', 'print("hello")')
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'text.py')
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert 'print("hello")' in obs.content
+        assert obs.content == 'L2: beta\nL3: gamma'
 
-    def test_read_directory_is_error(self, executor, temp_workspace):
-        """Test that reading a directory returns error."""
-        subdir = os.path.join(temp_workspace, 'subdir')
-        os.makedirs(subdir)
-        action = CodexReadFileAction(file_path=subdir)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
+    @pytest.mark.parametrize(
+        ('kwargs', 'expected'),
+        [
+            ({'offset': 0}, 'offset must be a 1-indexed line number'),
+            ({'limit': 0}, 'limit must be greater than zero'),
+        ],
+    )
+    def test_slice_validation_errors_are_exact(
+        self, executor, temp_workspace, kwargs, expected
+    ):
+        path = create_test_file(temp_workspace, 'valid.txt', 'one\n')
+
+        obs = self.run(
+            executor,
+            CodexReadFileAction(file_path=path, **kwargs),
+        )
+
         assert isinstance(obs, ErrorObservation)
-        assert 'directory' in obs.content.lower()
+        assert obs.content == expected
 
-    def test_read_file_suggestions_on_not_found(self, executor, temp_workspace):
-        """Test similar file names suggested when not found."""
-        # The handler checks: basename in entry or entry in basename (substring match)
-        create_test_file(temp_workspace, 'mymodule.py', 'content')
-        create_test_file(temp_workspace, 'mymodule_test.py', 'content')
-        # "mymodule" is a substring of both entries
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'mymodule')
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
+    def test_relative_path_error_is_exact(self, executor):
+        obs = self.run(executor, CodexReadFileAction(file_path='relative.txt'))
+
         assert isinstance(obs, ErrorObservation)
-        assert 'did you mean' in obs.content.lower()
+        assert obs.content == 'file_path must be an absolute path'
 
-    def test_read_empty_file(self, executor, temp_workspace):
-        """Test reading an empty file."""
-        create_test_file(temp_workspace, 'empty.txt', '')
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'empty.txt')
+    def test_offset_past_eof_error_is_exact(self, executor, temp_workspace):
+        path = create_test_file(temp_workspace, 'short.txt', 'one\ntwo\n')
+
+        obs = self.run(
+            executor,
+            CodexReadFileAction(file_path=path, offset=3, limit=1),
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'offset exceeds file length'
+
+    def test_empty_file_is_offset_error(self, executor, temp_workspace):
+        path = create_test_file(temp_workspace, 'empty.txt', '')
+
+        obs = self.run(executor, CodexReadFileAction(file_path=path))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'offset exceeds file length'
+
+    def test_missing_file_os_error_is_exact(self, executor, temp_workspace):
+        path = os.path.join(temp_workspace, 'missing.txt')
+
+        obs = self.run(executor, CodexReadFileAction(file_path=path))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'failed to read file: '
+            f'{os.strerror(2)} (os error 2)'
+        )
+
+    def test_directory_os_error_is_exact(self, executor, temp_workspace):
+        path = os.path.join(temp_workspace, 'directory')
+        os.makedirs(path)
+
+        obs = self.run(executor, CodexReadFileAction(file_path=path))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'failed to read file: '
+            f'{os.strerror(21)} (os error 21)'
+        )
+
+    def test_crlf_is_stripped_but_unterminated_cr_is_data(
+        self, executor, temp_workspace
+    ):
+        path = os.path.join(temp_workspace, 'crlf.txt')
+        with open(path, 'wb') as file:
+            file.write(b'one\r\ntwo\nlast\r')
+
+        obs = self.run(executor, CodexReadFileAction(file_path=path))
+
         assert isinstance(obs, CmdOutputObservation)
-        assert 'end of file' in obs.content.lower() or 'total' in obs.content.lower()
+        assert obs.content == 'L1: one\nL2: two\nL3: last\r'
 
-    def test_read_file_shows_has_more_indicator(self, executor, temp_workspace):
-        """Test that output indicates when more lines exist."""
-        content = '\n'.join([f'line {i}' for i in range(1, 50)])
-        create_test_file(temp_workspace, 'big.txt', content)
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'big.txt'), limit=5
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'offset' in obs.content.lower() or 'more' in obs.content.lower()
+    def test_non_utf8_and_nul_bytes_are_read_lossily(
+        self, executor, temp_workspace
+    ):
+        path = os.path.join(temp_workspace, 'bytes.dat')
+        with open(path, 'wb') as file:
+            file.write(b'\xff\xfe\n\x00text\n')
 
-    def test_read_file_shows_end_of_file(self, executor, temp_workspace):
-        """Test end-of-file indicator when reading to the end."""
-        create_test_file(temp_workspace, 'small.txt', 'a\nb\nc')
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'small.txt'), limit=2000
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'end of file' in obs.content.lower() or 'total' in obs.content.lower()
+        obs = self.run(executor, CodexReadFileAction(file_path=path))
 
-    def test_read_file_relative_path(self, executor, temp_workspace):
-        """Test reading with a relative path resolved from cwd."""
-        create_test_file(temp_workspace, 'rel.txt', 'hello')
-        action = CodexReadFileAction(file_path='rel.txt')
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert 'hello' in obs.content
+        assert obs.content == 'L1: ��\nL2: \x00text'
 
-    def test_read_file_unicode_content(self, executor, temp_workspace):
-        """Test reading file with Unicode content."""
-        create_test_file(temp_workspace, 'uni.txt', 'naïve café ✅\nline 2')
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'uni.txt')
+    def test_line_is_clipped_at_500_utf8_bytes(
+        self, executor, temp_workspace
+    ):
+        path = create_test_file(
+            temp_workspace,
+            'long.txt',
+            'a' * 498 + 'é' + 'z\n',
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'naïve café ✅' in obs.content
+
+        obs = self.run(executor, CodexReadFileAction(file_path=path))
+
+        shown = 'a' * 498 + 'é'
+        assert len(shown.encode('utf-8')) == 500
+        assert obs.content == f'L1: {shown}'
 
 
 # ==============================================================================
@@ -252,11 +248,12 @@ class TestCodexReadFileHandler:
 
 
 class TestCodexReadFileIndentationMode:
-    """Tests for the indentation-aware block reading mode via actual handler."""
+    """Exact indentation-mode integration tests for ``read_file``."""
 
     @pytest.fixture
     def executor(self, temp_workspace):
         from openhands.runtime.action_execution_server import ActionExecutor
+
         executor = MagicMock(spec=ActionExecutor)
         executor.bash_session = MagicMock()
         executor.bash_session.cwd = temp_workspace
@@ -265,79 +262,77 @@ class TestCodexReadFileIndentationMode:
         executor._codex_read_file_indentation = ActionExecutor._codex_read_file_indentation.__get__(executor)
         return executor
 
-    def test_indentation_finds_anchor_block(self, executor, temp_workspace):
-        """Test that indentation mode includes surrounding context."""
+    @staticmethod
+    def run(executor, action):
+        return asyncio.run(executor.codex_read_file(action))
+
+    def test_indentation_block_body_is_exact(self, executor, temp_workspace):
         content = (
-            'class MyClass:\n'
-            '    def method_one(self):\n'
-            '        x = 1\n'
-            '        y = 2\n'
-            '        return x + y\n'
-            '\n'
-            '    def method_two(self):\n'
-            '        return 42\n'
+            'fn outer() {\n'
+            '    if cond {\n'
+            '        inner();\n'
+            '    }\n'
+            '    tail();\n'
+            '}\n'
         )
-        create_test_file(temp_workspace, 'test.py', content)
+        path = create_test_file(temp_workspace, 'block.rs', content)
         action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'test.py'),
+            file_path=path,
             mode='indentation',
-            indentation={'anchor_line': 3, 'max_levels': 0},
+            limit=10,
+            indentation={'anchor_line': 3, 'max_levels': 1},
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
+
+        obs = self.run(executor, action)
+
         assert isinstance(obs, CmdOutputObservation)
-        assert 'x = 1' in obs.content
-        assert 'class MyClass' in obs.content  # Should walk up to parent
+        assert obs.content == (
+            'L2:     if cond {\n'
+            'L3:         inner();\n'
+            'L4:     }'
+        )
 
-    def test_indentation_walks_up_to_parent(self, executor, temp_workspace):
-        """Test that indentation mode walks up to find parent blocks."""
-        content = (
-            'class Foo:\n'
-            '    def bar(self):\n'
-            '        x = 1\n'
-            '        y = 2\n'
-        )
-        create_test_file(temp_workspace, 'test.py', content)
+    def test_indentation_limit_one_returns_only_anchor(
+        self, executor, temp_workspace
+    ):
+        path = create_test_file(temp_workspace, 'one.py', 'parent\n    child\n')
         action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'test.py'),
+            file_path=path,
             mode='indentation',
-            indentation={'anchor_line': 3, 'max_levels': 0},
+            limit=1,
+            indentation={'anchor_line': 2},
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'class Foo' in obs.content
-        assert 'def bar' in obs.content
-        assert 'x = 1' in obs.content
 
-    def test_indentation_respects_max_levels(self, executor, temp_workspace):
-        """Test that max_levels=1 limits how far up we walk."""
-        content = (
-            'class Outer:\n'
-            '    class Inner:\n'
-            '        def method(self):\n'
-            '            x = 1\n'
-        )
-        create_test_file(temp_workspace, 'test.py', content)
-        action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'test.py'),
-            mode='indentation',
-            indentation={'anchor_line': 4, 'max_levels': 1},
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
-        assert 'def method' in obs.content
-        assert 'x = 1' in obs.content
-        # max_levels=1 should stop at def method, not reach class Outer
-        # (depending on header inclusion it may still show it, but the walk should stop)
+        obs = self.run(executor, action)
 
-    def test_indentation_anchor_beyond_eof(self, executor, temp_workspace):
-        """Test error when anchor line is beyond end of file."""
-        create_test_file(temp_workspace, 'test.py', 'a\nb\nc\n')
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == 'L2:     child'
+
+    @pytest.mark.parametrize(
+        ('indentation', 'expected'),
+        [
+            (
+                {'anchor_line': 0},
+                'anchor_line must be a 1-indexed line number',
+            ),
+            ({'max_lines': 0}, 'max_lines must be greater than zero'),
+            ({'anchor_line': 3}, 'anchor_line exceeds file length'),
+        ],
+    )
+    def test_indentation_errors_are_exact(
+        self, executor, temp_workspace, indentation, expected
+    ):
+        path = create_test_file(temp_workspace, 'two.txt', 'one\ntwo\n')
         action = CodexReadFileAction(
-            file_path=os.path.join(temp_workspace, 'test.py'),
+            file_path=path,
             mode='indentation',
-            indentation={'anchor_line': 999},
+            indentation=indentation,
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_read_file(action))
+
+        obs = self.run(executor, action)
+
         assert isinstance(obs, ErrorObservation)
-        assert 'beyond' in obs.content.lower() or 'anchor' in obs.content.lower()
+        assert obs.content == expected
 
 
 # ==============================================================================
@@ -346,11 +341,12 @@ class TestCodexReadFileIndentationMode:
 
 
 class TestCodexListDirHandler:
-    """Tests for the codex_list_dir handler calling the actual handler method."""
+    """Exact rust-v0.98.0 ``list_dir`` handler contract tests."""
 
     @pytest.fixture
     def executor(self, temp_workspace):
         from openhands.runtime.action_execution_server import ActionExecutor
+
         executor = MagicMock(spec=ActionExecutor)
         executor.bash_session = MagicMock()
         executor.bash_session.cwd = temp_workspace
@@ -358,111 +354,195 @@ class TestCodexListDirHandler:
         executor.codex_list_dir = ActionExecutor.codex_list_dir.__get__(executor)
         return executor
 
-    def test_list_dir_basic(self, executor, temp_workspace):
-        """Test basic directory listing via handler."""
-        create_test_file(temp_workspace, 'file1.py', 'content')
-        create_test_file(temp_workspace, 'file2.txt', 'content')
-        os.makedirs(os.path.join(temp_workspace, 'subdir'))
+    @staticmethod
+    def run(executor, action):
+        return asyncio.run(executor.codex_list_dir(action))
 
-        action = CodexListDirAction(dir_path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert isinstance(obs, CmdOutputObservation)
-        assert '[file] file1.py' in obs.content
-        assert '[file] file2.txt' in obs.content
-        assert '[dir] subdir' in obs.content
-
-    def test_list_dir_format_with_numbers(self, executor, temp_workspace):
-        """Test entries are 1-indexed numbered with type labels."""
-        create_test_file(temp_workspace, 'alpha.py', '')
-        create_test_file(temp_workspace, 'beta.txt', '')
-
-        action = CodexListDirAction(dir_path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert '1. [file] alpha.py' in obs.content
-        assert '2. [file] beta.txt' in obs.content
-
-    def test_list_dir_with_depth(self, executor, temp_workspace):
-        """Test depth control limits recursion."""
-        create_test_file(temp_workspace, 'root.py', '')
-        create_test_file(temp_workspace, 'sub/level1.py', '')
-        create_test_file(temp_workspace, 'sub/deep/level2.py', '')
-
-        # Depth=1: only root-level items
-        action = CodexListDirAction(dir_path=temp_workspace, depth=1)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert 'root.py' in obs.content
-        assert '[dir] sub' in obs.content
-        assert 'level1.py' not in obs.content  # Too deep
-
-        # Depth=2: includes first sublevel
-        action2 = CodexListDirAction(dir_path=temp_workspace, depth=2)
-        obs2 = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action2))
-        assert 'level1.py' in obs2.content
-
-    def test_list_dir_offset_and_limit(self, executor, temp_workspace):
-        """Test pagination with offset and limit."""
-        for i in range(10):
-            create_test_file(temp_workspace, f'file_{i:02d}.py', '')
-
-        action = CodexListDirAction(dir_path=temp_workspace, offset=3, limit=3)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        # 3rd entry (1-indexed) should be file_02.py (sorted)
-        assert 'file_02.py' in obs.content
-        lines = [l for l in obs.content.strip().split('\n') if l.startswith(('3.', '4.', '5.'))]
-        assert len(lines) == 3
-
-    def test_list_dir_nonexistent(self, executor, temp_workspace):
-        """Test listing a nonexistent directory returns error."""
-        action = CodexListDirAction(
-            dir_path=os.path.join(temp_workspace, 'nonexistent')
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'not found' in obs.content.lower()
-
-    def test_list_dir_skips_hidden_files(self, executor, temp_workspace):
-        """Test that hidden files are skipped."""
+    def test_entry_kinds_hidden_files_and_body_are_exact(
+        self, executor, temp_workspace
+    ):
         create_test_file(temp_workspace, '.hidden', '')
-        create_test_file(temp_workspace, 'visible.py', '')
+        create_test_file(temp_workspace, 'alpha.txt', '')
+        os.makedirs(os.path.join(temp_workspace, 'nested'))
+        create_test_file(temp_workspace, 'nested/child.txt', '')
+        os.symlink('alpha.txt', os.path.join(temp_workspace, 'link'))
+        os.mkfifo(os.path.join(temp_workspace, 'pipe'))
 
-        action = CodexListDirAction(dir_path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert '.hidden' not in obs.content
-        assert 'visible.py' in obs.content
+        obs = self.run(
+            executor,
+            CodexListDirAction(dir_path=temp_workspace, depth=2, limit=20),
+        )
 
-    def test_list_dir_file_path_is_error(self, executor, temp_workspace):
-        """Test listing a file (not directory) returns error."""
-        filepath = create_test_file(temp_workspace, 'file.txt', 'content')
-        action = CodexListDirAction(dir_path=filepath)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'not a directory' in obs.content.lower()
-
-    def test_list_dir_empty_directory(self, executor, temp_workspace):
-        """Test listing an empty directory."""
-        empty_dir = os.path.join(temp_workspace, 'empty')
-        os.makedirs(empty_dir)
-        action = CodexListDirAction(dir_path=empty_dir)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert 'no entries' in obs.content.lower()
-
-    def test_list_dir_shows_pagination_indicator(self, executor, temp_workspace):
-        """Test pagination indicator when more entries exist."""
-        for i in range(30):
-            create_test_file(temp_workspace, f'file_{i:02d}.py', '')
-
-        action = CodexListDirAction(dir_path=temp_workspace, limit=5)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
-        assert 'offset' in obs.content.lower() or 'more' in obs.content.lower()
-
-    def test_list_dir_relative_path(self, executor, temp_workspace):
-        """Test listing with a relative path resolved from cwd."""
-        os.makedirs(os.path.join(temp_workspace, 'mydir'))
-        create_test_file(temp_workspace, 'mydir/a.txt', '')
-        action = CodexListDirAction(dir_path='mydir')
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_list_dir(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert 'a.txt' in obs.content
+        assert obs.content == (
+            f'Absolute path: {temp_workspace}\n'
+            '.hidden\n'
+            'alpha.txt\n'
+            'link@\n'
+            'nested/\n'
+            '  child.txt\n'
+            'pipe?'
+        )
+
+    def test_depth_and_global_relative_path_sort_are_exact(
+        self, executor, temp_workspace
+    ):
+        os.makedirs(os.path.join(temp_workspace, 'a', 'deep'))
+        os.makedirs(os.path.join(temp_workspace, 'b'))
+        create_test_file(temp_workspace, 'a/z.txt', '')
+        create_test_file(temp_workspace, 'a/deep/grandchild.txt', '')
+        create_test_file(temp_workspace, 'aa.txt', '')
+        create_test_file(temp_workspace, 'b/a.txt', '')
+        create_test_file(temp_workspace, 'zz.txt', '')
+
+        depth_one = self.run(
+            executor,
+            CodexListDirAction(dir_path=temp_workspace, depth=1, limit=20),
+        )
+        depth_two = self.run(
+            executor,
+            CodexListDirAction(dir_path=temp_workspace, depth=2, limit=20),
+        )
+
+        assert depth_one.content == (
+            f'Absolute path: {temp_workspace}\n'
+            'a/\n'
+            'aa.txt\n'
+            'b/\n'
+            'zz.txt'
+        )
+        assert depth_two.content == (
+            f'Absolute path: {temp_workspace}\n'
+            'a/\n'
+            '  deep/\n'
+            '  z.txt\n'
+            'aa.txt\n'
+            'b/\n'
+            '  a.txt\n'
+            'zz.txt'
+        )
+
+    def test_pagination_uses_global_sort_and_exact_footer(
+        self, executor, temp_workspace
+    ):
+        os.makedirs(os.path.join(temp_workspace, 'a'))
+        os.makedirs(os.path.join(temp_workspace, 'b'))
+        create_test_file(temp_workspace, 'a/a_child.txt', '')
+        create_test_file(temp_workspace, 'b/b_child.txt', '')
+
+        first_page = self.run(
+            executor,
+            CodexListDirAction(
+                dir_path=temp_workspace,
+                offset=1,
+                limit=2,
+                depth=2,
+            ),
+        )
+        second_page = self.run(
+            executor,
+            CodexListDirAction(
+                dir_path=temp_workspace,
+                offset=3,
+                limit=2,
+                depth=2,
+            ),
+        )
+
+        assert first_page.content == (
+            f'Absolute path: {temp_workspace}\n'
+            'a/\n'
+            '  a_child.txt\n'
+            'More than 2 entries found'
+        )
+        assert second_page.content == (
+            f'Absolute path: {temp_workspace}\n'
+            'b/\n'
+            '  b_child.txt'
+        )
+
+    def test_empty_directory_body_is_only_absolute_path(
+        self, executor, temp_workspace
+    ):
+        empty = os.path.join(temp_workspace, 'empty')
+        os.makedirs(empty)
+
+        obs = self.run(executor, CodexListDirAction(dir_path=empty))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == f'Absolute path: {empty}'
+
+    def test_non_utf8_absolute_path_is_displayed_lossily(
+        self, executor, temp_workspace
+    ):
+        raw_path = os.fsencode(temp_workspace) + b'/invalid-\xff'
+        os.mkdir(raw_path)
+        path = os.fsdecode(raw_path)
+
+        obs = self.run(executor, CodexListDirAction(dir_path=path))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == f'Absolute path: {temp_workspace}/invalid-�'
+
+    @pytest.mark.parametrize(
+        ('kwargs', 'expected'),
+        [
+            (
+                {'offset': 0},
+                'offset must be a 1-indexed entry number',
+            ),
+            ({'limit': 0}, 'limit must be greater than zero'),
+            ({'depth': 0}, 'depth must be greater than zero'),
+        ],
+    )
+    def test_validation_errors_are_exact(
+        self, executor, temp_workspace, kwargs, expected
+    ):
+        obs = self.run(
+            executor,
+            CodexListDirAction(dir_path=temp_workspace, **kwargs),
+        )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == expected
+
+    def test_relative_path_error_is_exact(self, executor):
+        obs = self.run(executor, CodexListDirAction(dir_path='relative'))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'dir_path must be an absolute path'
+
+    def test_offset_past_entries_error_is_exact(
+        self, executor, temp_workspace
+    ):
+        create_test_file(temp_workspace, 'one.txt', '')
+
+        obs = self.run(
+            executor,
+            CodexListDirAction(dir_path=temp_workspace, offset=2),
+        )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'offset exceeds directory entry count'
+
+    @pytest.mark.parametrize(
+        ('path_kind', 'errno_value'),
+        [('missing', 2), ('file', 20)],
+    )
+    def test_directory_os_errors_are_exact(
+        self, executor, temp_workspace, path_kind, errno_value
+    ):
+        path = os.path.join(temp_workspace, path_kind)
+        if path_kind == 'file':
+            create_test_file(temp_workspace, path_kind, '')
+
+        obs = self.run(executor, CodexListDirAction(dir_path=path))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'failed to read directory: '
+            f'{os.strerror(errno_value)} (os error {errno_value})'
+        )
 
 
 # ==============================================================================
@@ -471,11 +551,12 @@ class TestCodexListDirHandler:
 
 
 class TestCodexGrepFilesHandler:
-    """Tests for the codex_grep_files handler calling the actual handler method."""
+    """Exact rust-v0.98.0 ``grep_files`` handler contract tests."""
 
     @pytest.fixture
     def executor(self, temp_workspace):
         from openhands.runtime.action_execution_server import ActionExecutor
+
         executor = MagicMock(spec=ActionExecutor)
         executor.bash_session = MagicMock()
         executor.bash_session.cwd = temp_workspace
@@ -483,141 +564,461 @@ class TestCodexGrepFilesHandler:
         executor.codex_grep_files = ActionExecutor.codex_grep_files.__get__(executor)
         return executor
 
-    def test_grep_returns_file_paths_not_lines(self, executor, temp_workspace):
-        """Test that grep_files returns file paths, not matching lines."""
-        create_test_file(temp_workspace, 'a.py', 'TODO: fix this')
-        create_test_file(temp_workspace, 'b.py', 'TODO: and this')
-        create_test_file(temp_workspace, 'c.py', 'no match here')
+    @staticmethod
+    def run(executor, action):
+        return asyncio.run(executor.codex_grep_files(action))
 
-        action = CodexGrepFilesAction(pattern='TODO', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
+    def test_exact_rg_argv_relative_path_and_glob_are_unchanged(
+        self, executor, temp_workspace
+    ):
+        search_path = os.path.join(temp_workspace, 'src')
+        os.makedirs(search_path)
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b'/repo/new.py\n/repo/old.py\n',
+            stderr=b'',
+        )
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ) as run_rg:
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='  TODO|FIXME  ',
+                    include='  **/*.{py,pyi}  ',
+                    path='src',
+                ),
+            )
+
         assert isinstance(obs, CmdOutputObservation)
-        # Should contain file paths for a.py and b.py
-        lines = [l for l in obs.content.strip().split('\n') if l.strip() and not l.startswith('(')]
-        assert len(lines) == 2
-        assert any('a.py' in l for l in lines)
-        assert any('b.py' in l for l in lines)
-        assert not any('c.py' in l for l in lines)
-
-    def test_grep_with_include_filter(self, executor, temp_workspace):
-        """Test include filter limits file types."""
-        create_test_file(temp_workspace, 'match.py', 'PATTERN')
-        create_test_file(temp_workspace, 'match.txt', 'PATTERN')
-        create_test_file(temp_workspace, 'match.js', 'PATTERN')
-
-        action = CodexGrepFilesAction(
-            pattern='PATTERN', path=temp_workspace, include='*.py'
+        assert obs.content == '/repo/new.py\n/repo/old.py'
+        run_rg.assert_called_once_with(
+            [
+                'rg',
+                '--files-with-matches',
+                '--sortr=modified',
+                '--regexp',
+                'TODO|FIXME',
+                '--no-messages',
+                '--glob',
+                '**/*.{py,pyi}',
+                '--',
+                search_path,
+            ],
+            capture_output=True,
+            timeout=30,
+            cwd=temp_workspace,
         )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        lines = [l for l in obs.content.strip().split('\n') if l.strip() and not l.startswith('(')]
-        assert len(lines) == 1
-        assert lines[0].endswith('.py')
 
-    def test_grep_no_matches(self, executor, temp_workspace):
-        """Test grep with no matches returns 'No matches found.'"""
-        create_test_file(temp_workspace, 'file.py', 'nothing here')
+    def test_default_path_is_working_directory_and_blank_glob_is_omitted(
+        self, executor, temp_workspace
+    ):
+        completed = subprocess.CompletedProcess([], 1, b'', b'ignored')
 
-        action = CodexGrepFilesAction(pattern='NONEXISTENT_XYZ_PATTERN', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        assert 'no matches' in obs.content.lower()
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ) as run_rg:
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='needle',
+                    path='',
+                    include='   ',
+                ),
+            )
 
-    def test_grep_regex_pattern(self, executor, temp_workspace):
-        """Test grep with regex pattern."""
-        create_test_file(temp_workspace, 'func.py', 'def my_function():\n    pass')
-        create_test_file(temp_workspace, 'cls.py', 'class MyClass:\n    pass')
-
-        action = CodexGrepFilesAction(pattern=r'def \w+\(', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        lines = [l for l in obs.content.strip().split('\n') if l.strip() and not l.startswith('(')]
-        assert len(lines) == 1
-        assert 'func.py' in lines[0]
-
-    def test_grep_empty_pattern_is_error(self, executor, temp_workspace):
-        """Test that empty pattern returns error."""
-        create_test_file(temp_workspace, 'file.py', 'content')
-        action = CodexGrepFilesAction(pattern='', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'empty' in obs.content.lower() or 'pattern' in obs.content.lower()
-
-    def test_grep_whitespace_only_pattern_is_error(self, executor, temp_workspace):
-        """Test that whitespace-only pattern returns error."""
-        create_test_file(temp_workspace, 'file.py', 'content')
-        action = CodexGrepFilesAction(pattern='   ', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        assert isinstance(obs, ErrorObservation)
-
-    def test_grep_nonexistent_path(self, executor, temp_workspace):
-        """Test grep on nonexistent path returns error."""
-        action = CodexGrepFilesAction(
-            pattern='test', path=os.path.join(temp_workspace, 'nonexistent')
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        assert isinstance(obs, ErrorObservation)
-        assert 'not exist' in obs.content.lower() or 'access' in obs.content.lower()
-
-    def test_grep_respects_limit(self, executor, temp_workspace):
-        """Test that results are limited."""
-        for i in range(20):
-            create_test_file(temp_workspace, f'file_{i}.py', 'UNIQUE_MATCH_PAT')
-
-        action = CodexGrepFilesAction(
-            pattern='UNIQUE_MATCH_PAT', path=temp_workspace, limit=5
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        lines = [l for l in obs.content.strip().split('\n') if l.strip() and not l.startswith('(')]
-        assert len(lines) == 5
-        assert 'truncated' in obs.content.lower()
-
-    def test_grep_include_recursive_glob(self, executor, temp_workspace):
-        """Test that include='**/*.py' works for recursive search."""
-        create_test_file(temp_workspace, 'root.py', 'DEEP_PAT')
-        create_test_file(temp_workspace, 'sub/nested.py', 'DEEP_PAT')
-        create_test_file(temp_workspace, 'sub/nested.txt', 'DEEP_PAT')
-
-        action = CodexGrepFilesAction(
-            pattern='DEEP_PAT', path=temp_workspace, include='**/*.py'
-        )
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        lines = [l for l in obs.content.strip().split('\n') if l.strip() and not l.startswith('(')]
-        assert all('.py' in l for l in lines)
-        assert not any('.txt' in l for l in lines)
-
-    def test_grep_relative_path(self, executor, temp_workspace):
-        """Test grep with relative path (resolved from cwd)."""
-        os.makedirs(os.path.join(temp_workspace, 'subdir'))
-        create_test_file(temp_workspace, 'subdir/file.py', 'REL_PAT')
-
-        action = CodexGrepFilesAction(pattern='REL_PAT', path='subdir')
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        assert 'file.py' in obs.content
-
-    def test_grep_invalid_regex_returns_error(self, executor, temp_workspace):
-        """Invalid regex pattern (unmatched paren) returns informative ErrorObservation.
-
-        Bug: patterns like 'write_records(' silently returned 'No matches found.'
-        Fix: return ErrorObservation explaining regex is invalid and how to escape.
-        """
-        create_test_file(temp_workspace, 'func.py', 'def write_records(data):\n    pass')
-
-        action = CodexGrepFilesAction(pattern='write_records(', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
-        # Should be an ErrorObservation, not a silent "No matches found."
-        assert isinstance(obs, ErrorObservation), (
-            f"Expected ErrorObservation for invalid regex, got: {type(obs).__name__}: {obs.content}"
-        )
-        assert 'invalid regex' in obs.content.lower() or 'escaped' in obs.content.lower()
-
-    def test_grep_valid_regex_alternation_works(self, executor, temp_workspace):
-        """Valid regex with alternation (|) should still work."""
-        create_test_file(temp_workspace, 'a.py', 'def foo(): pass')
-        create_test_file(temp_workspace, 'b.py', 'def bar(): pass')
-
-        action = CodexGrepFilesAction(pattern='foo|bar', path=temp_workspace)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_grep_files(action))
         assert isinstance(obs, CmdOutputObservation)
-        assert 'a.py' in obs.content
-        assert 'b.py' in obs.content
+        assert obs.content == 'No matches found.'
+        assert run_rg.call_args.args[0] == [
+            'rg',
+            '--files-with-matches',
+            '--sortr=modified',
+            '--regexp',
+            'needle',
+            '--no-messages',
+            '--',
+            temp_workspace,
+        ]
+
+    def test_limit_has_no_truncation_footer(self, executor, temp_workspace):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            b'/repo/one.py\n/repo/two.py\n/repo/three.py\n',
+            b'',
+        )
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ):
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='needle',
+                    path=temp_workspace,
+                    limit=2,
+                ),
+            )
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == '/repo/one.py\n/repo/two.py'
+
+    def test_limit_is_capped_at_2000(self, executor, temp_workspace):
+        stdout = b''.join(
+            f'{index:04x}\n'.encode() for index in range(2001)
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout, b'')
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ):
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='needle',
+                    path=temp_workspace,
+                    limit=5000,
+                ),
+            )
+
+        lines = obs.content.splitlines()
+        assert len(lines) == 2000
+        assert lines[-1] == '07cf'
+
+    @pytest.mark.parametrize('pattern', ['', '   \t\n'])
+    def test_empty_pattern_error_is_exact(
+        self, executor, temp_workspace, pattern
+    ):
+        obs = self.run(
+            executor,
+            CodexGrepFilesAction(pattern=pattern, path=temp_workspace),
+        )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'pattern must not be empty'
+
+    def test_zero_limit_error_is_exact(self, executor, temp_workspace):
+        obs = self.run(
+            executor,
+            CodexGrepFilesAction(
+                pattern='needle',
+                path=temp_workspace,
+                limit=0,
+            ),
+        )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'limit must be greater than zero'
+
+    def test_missing_path_error_is_exact(self, executor, temp_workspace):
+        missing = os.path.join(temp_workspace, 'missing')
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run'
+        ) as run_rg:
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(pattern='needle', path=missing),
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            f'unable to access `{missing}`: '
+            f'{os.strerror(2)} (os error 2)'
+        )
+        run_rg.assert_not_called()
+
+    def test_non_utf8_missing_path_error_is_displayed_lossily(
+        self, executor, temp_workspace
+    ):
+        raw_missing = os.fsencode(temp_workspace) + b'/missing-\xff'
+        missing = os.fsdecode(raw_missing)
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run'
+        ) as run_rg:
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(pattern='needle', path=missing),
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            f'unable to access `{temp_workspace}/missing-�`: '
+            f'{os.strerror(2)} (os error 2)'
+        )
+        run_rg.assert_not_called()
+
+    def test_rg_launch_error_is_exact(self, executor, temp_workspace):
+        launch_error = FileNotFoundError(2, os.strerror(2), 'rg')
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=launch_error,
+        ):
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='needle', path=temp_workspace
+                ),
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'failed to launch rg: '
+            f'{os.strerror(2)} (os error 2). '
+            'Ensure ripgrep is installed and on PATH.'
+        )
+
+    def test_rg_timeout_error_is_exact(self, executor, temp_workspace):
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=subprocess.TimeoutExpired('rg', 30),
+        ):
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='needle', path=temp_workspace
+                ),
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'rg timed out after 30 seconds'
+
+    def test_rg_nonzero_error_and_lossy_stderr_are_exact(
+        self, executor, temp_workspace
+    ):
+        completed = subprocess.CompletedProcess(
+            [],
+            2,
+            b'',
+            b'regex parse error: \xff\n',
+        )
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ):
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='write_records(', path=temp_workspace
+                ),
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'rg failed: regex parse error: �\n'
+
+    def test_invalid_utf8_stdout_lines_are_skipped(
+        self, executor, temp_workspace
+    ):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            b'/repo/valid.py\n/repo/\xff.py\n/repo/final.py\n',
+            b'',
+        )
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ):
+            obs = self.run(
+                executor,
+                CodexGrepFilesAction(
+                    pattern='needle', path=temp_workspace
+                ),
+            )
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == '/repo/valid.py\n/repo/final.py'
+
+
+class TestCodexFunctionOutputWiring:
+    """Producer truncation and CmdOutput constructor-bypass integration."""
+
+    generic_marker = '[... Observation truncated due to length ...]'
+    token_model = 'gpt-5.6-sol'
+    byte_model = 'unknown-model'
+
+    @pytest.fixture
+    def executor(self, temp_workspace):
+        from openhands.runtime.action_execution_server import ActionExecutor
+
+        executor = MagicMock(spec=ActionExecutor)
+        executor.bash_session = MagicMock()
+        executor.bash_session.cwd = temp_workspace
+        executor._resolve_path = ActionExecutor._resolve_path.__get__(executor)
+        executor.codex_read_file = ActionExecutor.codex_read_file.__get__(executor)
+        executor.codex_list_dir = ActionExecutor.codex_list_dir.__get__(executor)
+        executor.codex_grep_files = ActionExecutor.codex_grep_files.__get__(executor)
+        return executor
+
+    @staticmethod
+    def attach_model(action, function_name, model_name, call_id):
+        from openhands.events.tool import ToolCallMetadata
+
+        action.tool_call_metadata = ToolCallMetadata(
+            function_name=function_name,
+            tool_call_id=call_id,
+            model_response={'model': model_name},
+            total_calls_in_response=1,
+            tool_result_format='codex',
+        )
+        return action
+
+    def assert_model_policies(self, raw_body, token_obs, byte_obs):
+        from openhands.agenthub.codex_agent.tool_output import (
+            truncate_function_output,
+        )
+
+        assert 30_000 < len(raw_body) < 48_000
+        assert isinstance(token_obs, CmdOutputObservation)
+        assert isinstance(byte_obs, CmdOutputObservation)
+        assert token_obs.content == truncate_function_output(
+            raw_body,
+            model_name=self.token_model,
+        )
+        assert token_obs.content == raw_body
+
+        expected_byte_body = truncate_function_output(
+            raw_body,
+            model_name=self.byte_model,
+        )
+        removed_chars = len(raw_body) - 12_000
+        assert byte_obs.content == expected_byte_body
+        assert byte_obs.content.startswith(raw_body[:6_000])
+        assert byte_obs.content.endswith(raw_body[-6_000:])
+        assert (
+            f'…{removed_chars} chars truncated…' in byte_obs.content
+        )
+
+        assert self.generic_marker not in token_obs.content
+        assert self.generic_marker not in byte_obs.content
+
+    def test_read_file_model_policy_and_constructor_bypass(
+        self, executor, temp_workspace
+    ):
+        from openhands.agenthub.codex_agent.tool_output import format_read_slice
+
+        lines = [
+            f'{index:03d}-' + 'r' * 396
+            for index in range(90)
+        ]
+        path = create_test_file(
+            temp_workspace,
+            'large-read.txt',
+            '\n'.join(lines) + '\n',
+        )
+        raw_body = format_read_slice(lines, offset=1, limit=len(lines))
+
+        token_action = self.attach_model(
+            CodexReadFileAction(file_path=path, limit=len(lines)),
+            'read_file',
+            self.token_model,
+            'read-token',
+        )
+        byte_action = self.attach_model(
+            CodexReadFileAction(file_path=path, limit=len(lines)),
+            'read_file',
+            self.byte_model,
+            'read-byte',
+        )
+
+        token_obs = asyncio.run(executor.codex_read_file(token_action))
+        byte_obs = asyncio.run(executor.codex_read_file(byte_action))
+
+        self.assert_model_policies(raw_body, token_obs, byte_obs)
+
+    def test_list_dir_model_policy_and_constructor_bypass(
+        self, executor, temp_workspace
+    ):
+        names = [
+            f'{index:03d}-' + 'l' * 190 + '.txt'
+            for index in range(180)
+        ]
+        for name in names:
+            create_test_file(temp_workspace, name, '')
+        raw_body = (
+            f'Absolute path: {temp_workspace}\n' + '\n'.join(names)
+        )
+
+        token_action = self.attach_model(
+            CodexListDirAction(
+                dir_path=temp_workspace,
+                limit=len(names),
+                depth=1,
+            ),
+            'list_dir',
+            self.token_model,
+            'list-token',
+        )
+        byte_action = self.attach_model(
+            CodexListDirAction(
+                dir_path=temp_workspace,
+                limit=len(names),
+                depth=1,
+            ),
+            'list_dir',
+            self.byte_model,
+            'list-byte',
+        )
+
+        token_obs = asyncio.run(executor.codex_list_dir(token_action))
+        byte_obs = asyncio.run(executor.codex_list_dir(byte_action))
+
+        self.assert_model_policies(raw_body, token_obs, byte_obs)
+
+    def test_grep_files_model_policy_and_constructor_bypass(
+        self, executor, temp_workspace
+    ):
+        paths = [
+            f'/repo/{index:03d}-' + 'g' * 190 + '.py'
+            for index in range(180)
+        ]
+        raw_body = '\n'.join(paths)
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            (raw_body + '\n').encode(),
+            b'',
+        )
+
+        token_action = self.attach_model(
+            CodexGrepFilesAction(
+                pattern='needle',
+                path=temp_workspace,
+                limit=len(paths),
+            ),
+            'grep_files',
+            self.token_model,
+            'grep-token',
+        )
+        byte_action = self.attach_model(
+            CodexGrepFilesAction(
+                pattern='needle',
+                path=temp_workspace,
+                limit=len(paths),
+            ),
+            'grep_files',
+            self.byte_model,
+            'grep-byte',
+        )
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=completed,
+        ):
+            token_obs = asyncio.run(executor.codex_grep_files(token_action))
+            byte_obs = asyncio.run(executor.codex_grep_files(byte_action))
+
+        self.assert_model_policies(raw_body, token_obs, byte_obs)
 
 
 # ==============================================================================
@@ -897,7 +1298,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert isinstance(obs, CodexApplyPatchObservation)
         assert obs.success is True
         assert 'new_file.py' in obs.files_changed
@@ -920,7 +1321,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert isinstance(obs, CodexApplyPatchObservation)
         assert obs.success is True
         assert not os.path.exists(filepath)
@@ -934,7 +1335,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True
         nested_path = os.path.join(temp_workspace, 'deep', 'nested', 'dir', 'file.py')
         assert os.path.exists(nested_path)
@@ -942,7 +1343,7 @@ class TestCodexApplyPatchHandler:
     def test_apply_patch_empty_patch_is_error(self, executor):
         """Test that empty patch text returns an error."""
         action = CodexApplyPatchAction(patch='')
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert isinstance(obs, ErrorObservation)
         assert 'Empty patch' in obs.content
 
@@ -960,7 +1361,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
 
         with open(os.path.join(temp_workspace, 'test.py')) as f:
@@ -985,7 +1386,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
 
         with open(os.path.join(temp_workspace, 'test.py')) as f:
@@ -1008,7 +1409,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
 
         with open(os.path.join(temp_workspace, 'test.py')) as f:
@@ -1030,7 +1431,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
 
         with open(os.path.join(temp_workspace, 'test.py')) as f:
@@ -1060,7 +1461,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
 
         with open(os.path.join(temp_workspace, 'test.py')) as f:
@@ -1068,8 +1469,8 @@ class TestCodexApplyPatchHandler:
         assert content == 'a\nB\nc\nd\nE\nf\ng\n'
 
     def test_apply_patch_descriptive_error_file_not_found(self, executor, temp_workspace):
-        """Test descriptive error when file doesn't exist."""
-        patch = (
+        """A verification failure is returned raw, without a shell envelope."""
+        patch_text = (
             '*** Begin Patch\n'
             '*** Update File: nonexistent.py\n'
             '@@\n'
@@ -1077,11 +1478,15 @@ class TestCodexApplyPatchHandler:
             '+new\n'
             '*** End Patch'
         )
-        action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        action = CodexApplyPatchAction(patch=patch_text)
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
-        assert 'file not found' in obs.content.lower()
-        assert 'nonexistent.py' in obs.content
+        assert obs.files_changed == []
+        assert obs.content == (
+            'Errors (1):\n'
+            "  - Update failed: file not found 'nonexistent.py'"
+        )
+        assert not os.path.exists(os.path.join(temp_workspace, 'nonexistent.py'))
 
     def test_apply_patch_descriptive_error_context_not_found(self, executor, temp_workspace):
         """Test descriptive error when context line can't be found."""
@@ -1096,7 +1501,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'could not find context' in obs.content.lower()
 
@@ -1113,7 +1518,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'could not find' in obs.content.lower()
         assert 'this line does not exist' in obs.content
@@ -1121,7 +1526,7 @@ class TestCodexApplyPatchHandler:
     def test_apply_patch_descriptive_error_parse_failure(self, executor):
         """Test descriptive parse error on malformed patch."""
         action = CodexApplyPatchAction(patch='not a valid patch at all')
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert isinstance(obs, CodexApplyPatchObservation)
         assert obs.success is False
         assert 'parse error' in obs.content.lower()
@@ -1140,7 +1545,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
 
         assert not os.path.exists(os.path.join(temp_workspace, 'old.py'))
@@ -1191,7 +1596,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         assert 'moto/acm/models.py' in obs.files_changed
 
@@ -1213,7 +1618,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'file not found' in obs.content.lower()
         # The other file must be untouched
@@ -1231,7 +1636,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         # Directory and contents should still exist
         assert os.path.exists(os.path.join(temp_workspace, 'dir/foo.txt'))
@@ -1247,7 +1652,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True
         with open(os.path.join(temp_workspace, 'duplicate.txt')) as f:
             assert f.read() == 'new content\n'
@@ -1267,7 +1672,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         assert not os.path.exists(os.path.join(temp_workspace, 'old/name.txt'))
         with open(os.path.join(temp_workspace, 'renamed/dir/name.txt')) as f:
@@ -1286,7 +1691,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'input.txt')) as f:
             content = f.read()
@@ -1309,7 +1714,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'lines.txt')) as f:
             content = f.read()
@@ -1331,7 +1736,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(filepath) as f:
             content = f.read()
@@ -1350,10 +1755,17 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False  # Overall failure
-        assert 'created.txt' in obs.files_changed  # First op succeeded
+        assert obs.files_changed == ['created.txt']  # First op succeeded
+        assert obs.content == (
+            'Partial success (1 file(s) changed):\n'
+            '  A created.txt\n'
+            'Errors (1):\n'
+            "  - Update failed: file not found 'missing.txt'"
+        )
         assert os.path.exists(os.path.join(temp_workspace, 'created.txt'))
+        assert not os.path.exists(os.path.join(temp_workspace, 'missing.txt'))
         with open(os.path.join(temp_workspace, 'created.txt')) as f:
             assert f.read() == 'hello\n'
 
@@ -1374,7 +1786,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'foo.txt')) as f:
             content = f.read()
@@ -1389,7 +1801,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'parse error' in obs.content.lower() or 'unexpected' in obs.content.lower()
 
@@ -1400,7 +1812,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'no file' in obs.content.lower() or 'no operations' in obs.content.lower()
 
@@ -1417,7 +1829,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'could not find' in obs.content.lower()
         # File should be unchanged
@@ -1437,16 +1849,18 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         assert 'file not found' in obs.content.lower()
 
     def test_apply_patch_multiple_operations_combined(self, executor, temp_workspace):
-        """Scenario 002: Add, delete, and update in one patch."""
+        """Success uses Codex's exact shell body and grouped A/M/D summary."""
+        import re
+
         create_test_file(temp_workspace, 'delete.txt', 'obsolete\n')
         create_test_file(temp_workspace, 'modify.txt', 'line1\nline2\n')
 
-        patch = (
+        patch_text = (
             '*** Begin Patch\n'
             '*** Add File: nested/new.txt\n'
             '+created\n'
@@ -1457,10 +1871,27 @@ class TestCodexApplyPatchHandler:
             '+changed\n'
             '*** End Patch'
         )
-        action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        action = CodexApplyPatchAction(patch=patch_text)
+        obs = asyncio.run(
+            executor.codex_apply_patch(action)
+        )
+
         assert obs.success is True, f"Patch failed: {obs.content}"
-        assert len(obs.files_changed) == 3
+        assert obs.files_changed == [
+            'nested/new.txt',
+            'modify.txt',
+            'delete.txt',
+        ]
+        assert re.fullmatch(
+            r'Exit code: 0\n'
+            r'Wall time: (?:0|[1-9]\d*)(?:\.[1-9])? seconds\n'
+            r'Output:\n'
+            r'Success\. Updated the following files:\n'
+            r'A nested/new\.txt\n'
+            r'M modify\.txt\n'
+            r'D delete\.txt\n',
+            obs.content,
+        ) is not None
 
         # New file created
         with open(os.path.join(temp_workspace, 'nested/new.txt')) as f:
@@ -1470,9 +1901,7 @@ class TestCodexApplyPatchHandler:
         # File modified
         with open(os.path.join(temp_workspace, 'modify.txt')) as f:
             content = f.read()
-        assert 'line1' in content
-        assert 'changed' in content
-        assert 'line2' not in content
+        assert content == 'line1\nchanged\n'
 
     def test_apply_patch_move_to_new_directory(self, executor, temp_workspace):
         """Scenario 004: Move file to a new directory with update."""
@@ -1489,7 +1918,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         # Old file removed
         assert not os.path.exists(os.path.join(temp_workspace, 'old/name.txt'))
@@ -1516,7 +1945,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'multi.txt')) as f:
             content = f.read()
@@ -1537,7 +1966,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'tail.txt')) as f:
             content = f.read()
@@ -1557,7 +1986,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'foo.txt')) as f:
             assert f.read() == 'new\n'
@@ -1575,13 +2004,13 @@ class TestCodexApplyPatchHandler:
             '*** End Patch '
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'file.txt')) as f:
             assert f.read() == 'two\n'
 
     def test_apply_patch_success_file_summary(self, executor, temp_workspace):
-        """Verify success output lists files with A/M/D prefixes."""
+        """Verify an untruncated success body retains its final newline."""
         create_test_file(temp_workspace, 'del.txt', 'x')
         create_test_file(temp_workspace, 'mod.txt', 'old\n')
 
@@ -1597,11 +2026,73 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True
-        assert 'A new.txt' in obs.content
-        assert 'M mod.txt' in obs.content
-        assert 'D del.txt' in obs.content
+        assert obs.content.startswith(
+            'Exit code: 0\nWall time: '
+        )
+        duration, output = obs.content.removeprefix(
+            'Exit code: 0\nWall time: '
+        ).split(' seconds\nOutput:\n', maxsplit=1)
+        assert duration == f'{float(duration):.1f}'.removesuffix('.0')
+        assert output == (
+            'Success. Updated the following files:\n'
+            'A new.txt\n'
+            'M mod.txt\n'
+            'D del.txt\n'
+        )
+        with open(os.path.join(temp_workspace, 'new.txt')) as f:
+            assert f.read() == 'hello\n'
+        with open(os.path.join(temp_workspace, 'mod.txt')) as f:
+            assert f.read() == 'new\n'
+        assert not os.path.exists(os.path.join(temp_workspace, 'del.txt'))
+
+    def test_apply_patch_model_metadata_selects_byte_truncation(
+        self,
+        executor,
+        temp_workspace,
+    ):
+        """gpt-5.2 metadata selects Codex's 10k-byte shell-output policy."""
+        from openhands.events.tool import ToolCallMetadata
+
+        file_names = [
+            f'bulk/{index:03d}-' + 'x' * 40 + '.txt'
+            for index in range(210)
+        ]
+        patch_lines = ['*** Begin Patch']
+        for file_name in file_names:
+            patch_lines.extend((f'*** Add File: {file_name}', '+payload'))
+        patch_lines.append('*** End Patch')
+
+        action = CodexApplyPatchAction(patch='\n'.join(patch_lines))
+        action.tool_call_metadata = ToolCallMetadata(
+            function_name='apply_patch',
+            tool_call_id='call-byte-policy',
+            model_response={'model': 'gpt-5.2'},
+            total_calls_in_response=1,
+            tool_result_format='codex',
+        )
+        obs = asyncio.run(
+            executor.codex_apply_patch(action)
+        )
+
+        assert obs.success is True
+        assert obs.files_changed == file_names
+        header, truncated_output = obs.content.split(' seconds\n', maxsplit=1)
+        assert header.startswith('Exit code: 0\nWall time: ')
+        duration = header.removeprefix('Exit code: 0\nWall time: ')
+        assert duration == f'{float(duration):.1f}'.removesuffix('.0')
+        assert truncated_output.startswith(
+            'Total output lines: 211\n'
+            'Output:\n'
+            'Success. Updated the following files:\n'
+        )
+        assert obs.content.count('…1798 chars truncated…') == 1
+        assert 'tokens truncated' not in obs.content
+        assert obs.content.endswith(f'A {file_names[-1]}\n')
+        for file_name in (file_names[0], file_names[105], file_names[-1]):
+            with open(os.path.join(temp_workspace, file_name)) as f:
+                assert f.read() == 'payload\n'
 
     def test_apply_patch_error_output_includes_preview(self, executor, temp_workspace):
         """Verify error message includes a preview of the old_lines that couldn't be matched."""
@@ -1621,7 +2112,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
         # Should include preview of first 5 lines + truncation notice
         assert 'xxx line 1' in obs.content
@@ -1648,7 +2139,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is False
 
     def test_apply_patch_disambiguate_context_with_header(self, executor, temp_workspace):
@@ -1670,7 +2161,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'multi_ctx.txt')) as f:
             content = f.read()
@@ -1699,7 +2190,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'eof_anchor.txt')) as f:
             content = f.read()
@@ -1727,7 +2218,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         # Should either fail or the parser should handle the blank line as a context line
         # The original OpenCode test expects failure
         if obs.success:
@@ -1755,7 +2246,7 @@ class TestCodexApplyPatchHandler:
             'EOF'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         # Our parser does not strip heredoc wrappers — this is a known gap
         assert obs.success is False
         assert 'begin patch' in obs.content.lower() or 'parse error' in obs.content.lower()
@@ -1778,7 +2269,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'trailing_ws.txt')) as f:
             content = f.read()
@@ -1803,7 +2294,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'leading_ws.txt')) as f:
             content = f.read()
@@ -1831,7 +2322,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'unicode_punct.txt')) as f:
             content = f.read()
@@ -1856,7 +2347,7 @@ class TestCodexApplyPatchHandler:
             '*** End Patch'
         )
         action = CodexApplyPatchAction(patch=patch)
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_apply_patch(action))
+        obs = asyncio.run(executor.codex_apply_patch(action))
         assert obs.success is True, f"Patch failed: {obs.content}"
         with open(os.path.join(temp_workspace, 'insert_only.txt')) as f:
             assert f.read() == 'alpha\nbeta\nomega\n'
@@ -1884,7 +2375,7 @@ class TestCodexUpdatePlanHandler:
             {'step': 'Write feature', 'status': 'in_progress'},
             {'step': 'Test', 'status': 'pending'},
         ])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert isinstance(obs, CodexUpdatePlanObservation)
         assert obs.success is True
         assert obs.content == 'Plan updated'
@@ -1896,7 +2387,7 @@ class TestCodexUpdatePlanHandler:
             {'step': 'Step A', 'status': 'in_progress'},
             {'step': 'Step B', 'status': 'in_progress'},
         ])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert isinstance(obs, ErrorObservation)
         assert 'in_progress' in obs.content.lower()
 
@@ -1905,29 +2396,32 @@ class TestCodexUpdatePlanHandler:
         action = CodexUpdatePlanAction(plan=[
             {'step': 'Test', 'status': 'invalid_status'},
         ])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert isinstance(obs, ErrorObservation)
         assert 'invalid status' in obs.content.lower()
 
     def test_update_plan_requires_step_and_status(self, executor):
         """Test that missing step or status fields are rejected."""
         action = CodexUpdatePlanAction(plan=[{'status': 'pending'}])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert isinstance(obs, ErrorObservation)
         assert 'step' in obs.content.lower()
 
         action2 = CodexUpdatePlanAction(plan=[{'step': 'Do something'}])
-        obs2 = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action2))
+        obs2 = asyncio.run(executor.codex_update_plan(action2))
         assert isinstance(obs2, ErrorObservation)
         assert 'status' in obs2.content.lower()
 
     def test_update_plan_returns_plan_updated(self, executor):
-        """Test that response content is 'Plan updated'."""
+        """The model-visible body is exact and does not echo arguments."""
         action = CodexUpdatePlanAction(plan=[
             {'step': 'Task', 'status': 'pending'},
-        ])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        ], explanation='Keep this explanation out of the tool result.')
+        obs = asyncio.run(executor.codex_update_plan(action))
+        assert isinstance(obs, CodexUpdatePlanObservation)
+        assert obs.success is True
         assert obs.content == 'Plan updated'
+        assert obs.plan == [{'step': 'Task', 'status': 'pending'}]
 
     def test_update_plan_stores_state(self, executor):
         """Test that plan state is stored across calls."""
@@ -1935,7 +2429,7 @@ class TestCodexUpdatePlanHandler:
             {'step': 'Step 1', 'status': 'completed'},
             {'step': 'Step 2', 'status': 'in_progress'},
         ])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert obs.success is True
         assert obs.plan[0]['status'] == 'completed'
         assert obs.plan[1]['status'] == 'in_progress'
@@ -1943,7 +2437,7 @@ class TestCodexUpdatePlanHandler:
     def test_update_plan_empty_plan_list(self, executor):
         """Test updating with an empty plan list."""
         action = CodexUpdatePlanAction(plan=[])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert isinstance(obs, CodexUpdatePlanObservation)
         assert obs.success is True
 
@@ -1954,7 +2448,7 @@ class TestCodexUpdatePlanHandler:
             {'step': 'Step 2', 'status': 'completed'},
             {'step': 'Step 3', 'status': 'completed'},
         ])
-        obs = asyncio.get_event_loop().run_until_complete(executor.codex_update_plan(action))
+        obs = asyncio.run(executor.codex_update_plan(action))
         assert obs.success is True
         assert len(obs.plan) == 3
 

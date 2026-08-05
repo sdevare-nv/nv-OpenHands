@@ -1,3 +1,5 @@
+from typing import Literal
+
 from litellm import ModelResponse
 from pydantic import BaseModel
 
@@ -9,3 +11,6 @@ class ToolCallMetadata(BaseModel):
 
     model_response: ModelResponse
     total_calls_in_response: int
+    # Selects an agent-native model-visible result body. None keeps the generic
+    # OpenHands observation formatting.
+    tool_result_format: Literal['opencode', 'codex'] | None = None

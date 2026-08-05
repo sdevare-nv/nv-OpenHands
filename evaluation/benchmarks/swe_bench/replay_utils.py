@@ -73,12 +73,11 @@ _AGENT_TOOL_GROUPS: dict[str, list[str]] = {
     'OpenCodeAgent': [
         'BASH_TOOL_NAME', 'GLOB_TOOL_NAME', 'GREP_TOOL_NAME', 'LIST_DIR_TOOL_NAME',
         'READ_TOOL_NAME', 'WRITE_TOOL_NAME', 'EDIT_TOOL_NAME', 'OPENCODE_APPLY_PATCH_TOOL_NAME',
-        'QUESTION_TOOL_NAME', 'TODO_READ_TOOL_NAME', 'TODO_WRITE_TOOL_NAME', 'FINISH_TOOL_NAME',
+        'QUESTION_TOOL_NAME', 'TODO_READ_TOOL_NAME', 'TODO_WRITE_TOOL_NAME',
     ],
     'CodexAgent': [
         'CODEX_SHELL_COMMAND_TOOL_NAME', 'CODEX_READ_FILE_TOOL_NAME', 'CODEX_LIST_DIR_TOOL_NAME',
         'CODEX_GREP_FILES_TOOL_NAME', 'CODEX_APPLY_PATCH_TOOL_NAME', 'CODEX_UPDATE_PLAN_TOOL_NAME',
-        'FINISH_TOOL_NAME',
     ],
 }
 
@@ -312,7 +311,11 @@ def messages_to_replay_events(
                         replay_events.append(action)
             else:
                 tool_calls = msg.get('tool_calls')
-                if tool_calls:
+                stops_without_tool_call = agent_class in {
+                    'OpenCodeAgent',
+                    'CodexAgent',
+                }
+                if tool_calls or stops_without_tool_call:
                     response_dict = {
                         'id': f'replay-{len(replay_events)}',
                         'choices': [{
@@ -322,7 +325,7 @@ def messages_to_replay_events(
                                 'tool_calls': tool_calls,
                             },
                             'index': 0,
-                            'finish_reason': 'tool_calls',
+                            'finish_reason': 'tool_calls' if tool_calls else 'stop',
                         }],
                         'model': 'replay',
                     }
@@ -336,6 +339,8 @@ def messages_to_replay_events(
                         # is supplied here.
                         action._source = EventSource.AGENT
                         replay_events.append(action)
+                    if not tool_calls:
+                        break
                 else:
                     content = msg.get('content', '')
                     if content:

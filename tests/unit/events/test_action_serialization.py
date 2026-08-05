@@ -233,6 +233,37 @@ def test_file_edit_action_llm_serialization_deserialization():
     serialization_deserialization(original_action_dict, FileEditAction)
 
 
+def test_file_edit_action_replace_all_true_roundtrip():
+    action = FileEditAction(
+        path='/path/to/file.txt',
+        command='str_replace',
+        old_str='old',
+        new_str='new',
+        replace_all=True,
+    )
+
+    serialized = event_to_dict(action)
+    restored = event_from_dict(serialized)
+
+    assert serialized['args']['replace_all'] is True
+    assert isinstance(restored, FileEditAction)
+    assert restored.replace_all is True
+
+
+def test_file_edit_action_legacy_positional_arguments_stay_stable():
+    action = FileEditAction(
+        '/path/to/file.txt',
+        'insert',
+        None,
+        None,
+        'new text',
+        12,
+    )
+
+    assert action.insert_line == 12
+    assert action.replace_all is False
+
+
 def test_cmd_run_action_legacy_serialization():
     original_action_dict = {
         'action': 'run',

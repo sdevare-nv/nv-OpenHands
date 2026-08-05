@@ -7,12 +7,14 @@ These tests cover:
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from litellm import ModelResponse
 
 from openhands.agenthub.opencode_agent.function_calling import response_to_actions
+from openhands.agenthub.opencode_agent.opencode_agent import OpenCodeAgent
 from openhands.agenthub.opencode_agent.tools.edit import EditTool
 from openhands.agenthub.opencode_agent.tools.glob import GlobTool
 from openhands.agenthub.opencode_agent.tools.grep import GrepTool
@@ -22,6 +24,7 @@ from openhands.agenthub.opencode_agent.tools.write import WriteTool
 from openhands.core.exceptions import FunctionCallValidationError
 from openhands.core.schema import ActionType
 from openhands.events.action import (
+    AgentFinishAction,
     FileEditAction,
     GlobAction,
     GrepAction,
@@ -33,6 +36,7 @@ from openhands.events.action.agent import ValidationFailureAction
 from openhands.events.event import FileEditSource
 from openhands.llm.tool_names import (
     EDIT_TOOL_NAME,
+    FINISH_TOOL_NAME,
     GLOB_TOOL_NAME,
     GREP_TOOL_NAME,
     LIST_DIR_TOOL_NAME,
@@ -97,6 +101,24 @@ def create_mock_response_with_thought(
                 },
                 'index': 0,
                 'finish_reason': 'tool_calls',
+            }
+        ],
+    )
+
+
+def create_mock_response_no_tools(content: str | None) -> ModelResponse:
+    """Helper function to create a mock response with no tool calls."""
+    return ModelResponse(
+        id='mock-id',
+        choices=[
+            {
+                'message': {
+                    'tool_calls': None,
+                    'content': content,
+                    'role': 'assistant',
+                },
+                'index': 0,
+                'finish_reason': 'stop',
             }
         ],
     )
@@ -180,6 +202,15 @@ class TestToolDefinitions:
         # path is optional, so required should be empty or not include path
         assert 'required' not in params or 'path' not in params.get('required', [])
 
+    def test_finish_tool_is_not_advertised(self):
+        """OpenCode terminates on a response without tool calls."""
+        agent = OpenCodeAgent.__new__(OpenCodeAgent)
+        agent.config = SimpleNamespace(enable_cmd=False, enable_finish=True)
+
+        tool_names = [tool['function']['name'] for tool in agent._get_tools()]
+
+        assert FINISH_TOOL_NAME not in tool_names
+
 
 # ==============================================================================
 # ReadTool Function Calling Tests
@@ -196,7 +227,7 @@ class TestReadToolFunctionCalling:
         assert len(actions) == 1
         assert isinstance(actions[0], OpenCodeReadAction)
         assert actions[0].path == '/path/to/file.py'
-        assert actions[0].offset == 0  # default
+        assert actions[0].offset == 1  # OpenCode offsets are one-based
         assert actions[0].limit == 2000  # default
         assert actions[0].action == ActionType.OPENCODE_READ
 
@@ -219,7 +250,7 @@ class TestReadToolFunctionCalling:
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], OpenCodeReadAction)
-        assert actions[0].offset == 0
+        assert actions[0].offset == 1
         assert actions[0].limit == 500
 
     def test_read_tool_with_all_params(self):
@@ -346,7 +377,26 @@ class TestEditToolFunctionCalling:
         assert actions[0].old_str == 'def foo():'
         assert actions[0].new_str == 'def bar():'
         assert actions[0].command == 'str_replace'
+        assert actions[0].replace_all is False
         assert actions[0].impl_source == FileEditSource.OH_ACI
+
+    def test_edit_tool_replace_all_is_forwarded(self):
+        """The OpenCode replace_all argument reaches the runtime action."""
+        response = create_mock_response(
+            EDIT_TOOL_NAME,
+            {
+                'file_path': '/path/to/file.py',
+                'old_string': 'old',
+                'new_string': 'new',
+                'replace_all': True,
+            },
+        )
+
+        actions = response_to_actions(response)
+
+        assert len(actions) == 1
+        assert isinstance(actions[0], FileEditAction)
+        assert actions[0].replace_all is True
 
     def test_edit_tool_multiline_replacement(self):
         """Test EditTool with multiline strings."""
@@ -623,7 +673,7 @@ class TestOpenCodeReadAction:
         """Test basic action creation."""
         action = OpenCodeReadAction(path='/test.py')
         assert action.path == '/test.py'
-        assert action.offset == 0
+        assert action.offset == 1
         assert action.limit == 2000
         assert action.action == ActionType.OPENCODE_READ
         assert action.runnable is True
@@ -642,7 +692,7 @@ class TestOpenCodeReadAction:
     def test_action_message_with_offset(self):
         """Test action message with offset."""
         action = OpenCodeReadAction(path='/test.py', offset=50)
-        assert action.message == 'Reading file: /test.py (from line 51)'
+        assert action.message == 'Reading file: /test.py (from line 50)'
 
 
 class TestOpenCodeWriteAction:
@@ -774,6 +824,30 @@ class TestEdgeCases:
         assert len(actions) == 1
         assert isinstance(actions[0], ValidationFailureAction)
         assert 'parse' in actions[0].error_message.lower() or 'json' in actions[0].error_message.lower()
+
+    def test_content_only_response_finishes(self):
+        """A response without tool calls terminates the agent loop."""
+        response = create_mock_response_no_tools('Task completed successfully')
+
+        actions = response_to_actions(response)
+
+        assert len(actions) == 1
+        assert isinstance(actions[0], AgentFinishAction)
+        assert actions[0].final_thought == 'Task completed successfully'
+        assert actions[0].thought == 'Task completed successfully'
+        assert actions[0].tool_call_metadata.total_calls_in_response == 0
+        assert actions[0].response_id == 'mock-id'
+
+    def test_empty_response_finishes(self):
+        """Even an empty response without tool calls terminates the loop."""
+        response = create_mock_response_no_tools(None)
+
+        actions = response_to_actions(response)
+
+        assert len(actions) == 1
+        assert isinstance(actions[0], AgentFinishAction)
+        assert actions[0].final_thought == ''
+        assert actions[0].thought == ''
 
     def test_unicode_in_paths(self):
         """Test handling of Unicode characters in paths."""

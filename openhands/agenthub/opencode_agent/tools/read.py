@@ -15,7 +15,7 @@ Usage:
 
 Parameters:
 - file_path: The absolute path to the file to read
-- offset: Optional line number to start reading from (0-based, default: 0)
+- offset: Optional line number to start reading from (1-based, default: 1)
 - limit: Optional number of lines to read (default: 2000)
 
 Examples:
@@ -39,7 +39,7 @@ ReadTool = ChatCompletionToolParam(
                 },
                 'offset': {
                     'type': 'integer',
-                    'description': 'Line number to start reading from (0-based, default: 0)',
+                    'description': 'Line number to start reading from (1-based, default: 1)',
                 },
                 'limit': {
                     'type': 'integer',
@@ -49,4 +49,3 @@ ReadTool = ChatCompletionToolParam(
         },
     ),
 )
-

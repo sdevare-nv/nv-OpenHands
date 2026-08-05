@@ -7,19 +7,19 @@ These tests cover:
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from litellm import ModelResponse
 
+from openhands.agenthub.codex_agent.codex_agent import CodexAgent
 from openhands.agenthub.codex_agent.function_calling import response_to_actions
 from openhands.agenthub.codex_agent.tools.apply_patch import ApplyPatchTool
-from openhands.agenthub.codex_agent.tools.finish import FinishTool
 from openhands.agenthub.codex_agent.tools.grep_files import GrepFilesTool
 from openhands.agenthub.codex_agent.tools.list_dir import ListDirTool
 from openhands.agenthub.codex_agent.tools.read_file import ReadFileTool
 from openhands.agenthub.codex_agent.tools.shell_command import ShellCommandTool
 from openhands.agenthub.codex_agent.tools.update_plan import UpdatePlanTool
-from openhands.core.exceptions import FunctionCallValidationError
 from openhands.core.schema import ActionType
 from openhands.events.action import (
     AgentFinishAction,
@@ -29,6 +29,7 @@ from openhands.events.action import (
     CodexListDirAction,
     CodexReadFileAction,
     CodexUpdatePlanAction,
+    FunctionCallNotExistsAction,
     ValidationFailureAction,
 )
 from openhands.llm.tool_names import (
@@ -121,7 +122,9 @@ def create_mock_response_no_tools(content: str) -> ModelResponse:
     )
 
 
-def create_mock_response_multi_tool(tool_calls: list[tuple[str, dict]]) -> ModelResponse:
+def create_mock_response_multi_tool(
+    tool_calls: list[tuple[str, dict]],
+) -> ModelResponse:
     """Helper to create a mock response with multiple tool calls."""
     return ModelResponse(
         id='mock-id',
@@ -185,7 +188,9 @@ class TestToolDefinitions:
 
     def test_read_file_indentation_params(self):
         """Test ReadFileTool indentation sub-object has correct properties."""
-        indent_props = ReadFileTool['function']['parameters']['properties']['indentation']
+        indent_props = ReadFileTool['function']['parameters']['properties'][
+            'indentation'
+        ]
         assert indent_props['type'] == 'object'
         sub_props = indent_props['properties']
         assert 'anchor_line' in sub_props
@@ -245,12 +250,14 @@ class TestToolDefinitions:
         assert items_schema['type'] == 'object'
         assert set(items_schema['required']) == {'step', 'status'}
 
-    def test_finish_tool_schema(self):
-        """Test FinishTool has correct schema structure."""
-        assert FinishTool['type'] == 'function'
-        func = FinishTool['function']
-        assert func['name'] == FINISH_TOOL_NAME
-        assert 'message' in func['parameters']['properties']
+    def test_finish_tool_is_not_advertised(self):
+        """Codex terminates on a response without tool calls."""
+        agent = CodexAgent.__new__(CodexAgent)
+        agent.config = SimpleNamespace(enable_cmd=False, enable_finish=True)
+
+        tool_names = [tool['function']['name'] for tool in agent._get_tools()]
+
+        assert FINISH_TOOL_NAME not in tool_names
 
 
 # ==============================================================================
@@ -263,7 +270,9 @@ class TestShellCommandFunctionCalling:
 
     def test_shell_command_valid_basic(self):
         """Test shell_command with just command."""
-        response = create_mock_response(CODEX_SHELL_COMMAND_TOOL_NAME, {'command': 'ls -la'})
+        response = create_mock_response(
+            CODEX_SHELL_COMMAND_TOOL_NAME, {'command': 'ls -la'}
+        )
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], CmdRunAction)
@@ -282,7 +291,8 @@ class TestShellCommandFunctionCalling:
     def test_shell_command_timeout_capped_at_600(self):
         """Test shell_command timeout is capped at 600 seconds."""
         response = create_mock_response(
-            CODEX_SHELL_COMMAND_TOOL_NAME, {'command': 'long_cmd', 'timeout_ms': 999999999}
+            CODEX_SHELL_COMMAND_TOOL_NAME,
+            {'command': 'long_cmd', 'timeout_ms': 999999999},
         )
         actions = response_to_actions(response)
         assert len(actions) == 1
@@ -290,7 +300,9 @@ class TestShellCommandFunctionCalling:
 
     def test_shell_command_missing_command(self):
         """Test shell_command returns validation failure when command missing."""
-        response = create_mock_response(CODEX_SHELL_COMMAND_TOOL_NAME, {'workdir': '/tmp'})
+        response = create_mock_response(
+            CODEX_SHELL_COMMAND_TOOL_NAME, {'workdir': '/tmp'}
+        )
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], ValidationFailureAction)
@@ -298,7 +310,9 @@ class TestShellCommandFunctionCalling:
     def test_shell_command_with_thought(self):
         """Test shell_command preserves thought content."""
         response = create_mock_response_with_thought(
-            CODEX_SHELL_COMMAND_TOOL_NAME, {'command': 'echo hello'}, 'Let me run this command'
+            CODEX_SHELL_COMMAND_TOOL_NAME,
+            {'command': 'echo hello'},
+            'Let me run this command',
         )
         actions = response_to_actions(response)
         assert len(actions) == 1
@@ -315,7 +329,9 @@ class TestReadFileFunctionCalling:
 
     def test_read_file_valid_basic(self):
         """Test read_file with just file_path."""
-        response = create_mock_response(CODEX_READ_FILE_TOOL_NAME, {'file_path': '/path/to/file.py'})
+        response = create_mock_response(
+            CODEX_READ_FILE_TOOL_NAME, {'file_path': '/path/to/file.py'}
+        )
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], CodexReadFileAction)
@@ -378,7 +394,9 @@ class TestReadFileFunctionCalling:
     def test_read_file_with_thought(self):
         """Test read_file preserves thought content."""
         response = create_mock_response_with_thought(
-            CODEX_READ_FILE_TOOL_NAME, {'file_path': '/test.py'}, 'Let me read this file'
+            CODEX_READ_FILE_TOOL_NAME,
+            {'file_path': '/test.py'},
+            'Let me read this file',
         )
         actions = response_to_actions(response)
         assert len(actions) == 1
@@ -395,7 +413,9 @@ class TestListDirFunctionCalling:
 
     def test_list_dir_valid_basic(self):
         """Test list_dir with just dir_path."""
-        response = create_mock_response(CODEX_LIST_DIR_TOOL_NAME, {'dir_path': '/workspace'})
+        response = create_mock_response(
+            CODEX_LIST_DIR_TOOL_NAME, {'dir_path': '/workspace'}
+        )
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], CodexListDirAction)
@@ -450,7 +470,12 @@ class TestGrepFilesFunctionCalling:
         """Test grep_files with all parameters."""
         response = create_mock_response(
             CODEX_GREP_FILES_TOOL_NAME,
-            {'pattern': 'def \\w+', 'include': '*.py', 'path': '/workspace/src', 'limit': 50},
+            {
+                'pattern': 'def \\w+',
+                'include': '*.py',
+                'path': '/workspace/src',
+                'limit': 50,
+            },
         )
         actions = response_to_actions(response)
         assert len(actions) == 1
@@ -517,12 +542,7 @@ class TestApplyPatchFunctionCalling:
 
     def test_apply_patch_delete_file(self):
         """Test apply_patch for file deletion."""
-        patch = (
-            '*** Begin Patch\n'
-            '--- a/old_file.py\n'
-            '+++ /dev/null\n'
-            '*** End Patch'
-        )
+        patch = '*** Begin Patch\n--- a/old_file.py\n+++ /dev/null\n*** End Patch'
         response = create_mock_response(CODEX_APPLY_PATCH_TOOL_NAME, {'input': patch})
         actions = response_to_actions(response)
         assert len(actions) == 1
@@ -556,7 +576,8 @@ class TestUpdatePlanFunctionCalling:
         """Test update_plan with explanation."""
         plan = [{'step': 'First step', 'status': 'pending'}]
         response = create_mock_response(
-            CODEX_UPDATE_PLAN_TOOL_NAME, {'plan': plan, 'explanation': 'Starting work on the task'}
+            CODEX_UPDATE_PLAN_TOOL_NAME,
+            {'plan': plan, 'explanation': 'Starting work on the task'},
         )
         actions = response_to_actions(response)
         assert len(actions) == 1
@@ -565,35 +586,12 @@ class TestUpdatePlanFunctionCalling:
 
     def test_update_plan_missing_plan(self):
         """Test update_plan returns validation failure when plan is missing."""
-        response = create_mock_response(CODEX_UPDATE_PLAN_TOOL_NAME, {'explanation': 'test'})
+        response = create_mock_response(
+            CODEX_UPDATE_PLAN_TOOL_NAME, {'explanation': 'test'}
+        )
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], ValidationFailureAction)
-
-
-# ==============================================================================
-# Finish Function Calling Tests
-# ==============================================================================
-
-
-class TestFinishFunctionCalling:
-    """Tests for Finish function calling."""
-
-    def test_finish_with_message(self):
-        """Test finish with message."""
-        response = create_mock_response(FINISH_TOOL_NAME, {'message': 'Task completed successfully'})
-        actions = response_to_actions(response)
-        assert len(actions) == 1
-        assert isinstance(actions[0], AgentFinishAction)
-        assert actions[0].final_thought == 'Task completed successfully'
-
-    def test_finish_without_message(self):
-        """Test finish without message."""
-        response = create_mock_response(FINISH_TOOL_NAME, {})
-        actions = response_to_actions(response)
-        assert len(actions) == 1
-        assert isinstance(actions[0], AgentFinishAction)
-        assert actions[0].final_thought == ''
 
 
 # ==============================================================================
@@ -604,12 +602,15 @@ class TestFinishFunctionCalling:
 class TestEdgeCases:
     """Tests for edge cases and error handling."""
 
-    def test_unknown_tool_raises_error(self):
-        """Test that unknown tool name raises FunctionCallNotExistsError."""
+    def test_unknown_tool_returns_structured_failure_action(self):
+        """Unknown tools are returned to the model as structured failures."""
         response = create_mock_response('nonexistent_tool', {'arg': 'value'})
-        from openhands.core.exceptions import FunctionCallNotExistsError
-        with pytest.raises(FunctionCallNotExistsError):
-            response_to_actions(response)
+        actions = response_to_actions(response)
+
+        assert len(actions) == 1
+        assert isinstance(actions[0], FunctionCallNotExistsAction)
+        assert actions[0].function_name == 'nonexistent_tool'
+        assert actions[0].tool_call_metadata.tool_result_format is None
 
     def test_invalid_json_arguments(self):
         """Test that invalid JSON in arguments returns validation failure."""
@@ -641,17 +642,18 @@ class TestEdgeCases:
         assert isinstance(actions[0], ValidationFailureAction)
 
     def test_content_only_response(self):
-        """Test response with content but no tool calls."""
-        from openhands.events.action import MessageAction
+        """Test that a response with no tool calls terminates the loop."""
         response = create_mock_response_no_tools('Here is my explanation...')
         actions = response_to_actions(response)
         assert len(actions) == 1
-        assert isinstance(actions[0], MessageAction)
-        assert actions[0].content == 'Here is my explanation...'
+        assert isinstance(actions[0], AgentFinishAction)
+        assert actions[0].final_thought == 'Here is my explanation...'
+        assert actions[0].thought == 'Here is my explanation...'
+        assert actions[0].tool_call_metadata.total_calls_in_response == 0
+        assert actions[0].response_id == 'mock-id'
 
-    def test_empty_response_raises_error(self):
-        """Test that empty response raises LLMContextWindowExceedError."""
-        from openhands.core.exceptions import LLMContextWindowExceedError
+    def test_empty_response_finishes(self):
+        """Test that an empty response without tool calls terminates the loop."""
         response = ModelResponse(
             id='mock-id',
             choices=[
@@ -666,15 +668,20 @@ class TestEdgeCases:
                 }
             ],
         )
-        with pytest.raises(LLMContextWindowExceedError):
-            response_to_actions(response)
+        actions = response_to_actions(response)
+        assert len(actions) == 1
+        assert isinstance(actions[0], AgentFinishAction)
+        assert actions[0].final_thought == ''
+        assert actions[0].thought == ''
 
     def test_multiple_tool_calls(self):
         """Test response with multiple parallel tool calls."""
-        response = create_mock_response_multi_tool([
-            (CODEX_READ_FILE_TOOL_NAME, {'file_path': '/file1.py'}),
-            (CODEX_GREP_FILES_TOOL_NAME, {'pattern': 'TODO'}),
-        ])
+        response = create_mock_response_multi_tool(
+            [
+                (CODEX_READ_FILE_TOOL_NAME, {'file_path': '/file1.py'}),
+                (CODEX_GREP_FILES_TOOL_NAME, {'pattern': 'TODO'}),
+            ]
+        )
         actions = response_to_actions(response)
         assert len(actions) == 2
         assert isinstance(actions[0], CodexReadFileAction)
@@ -718,17 +725,45 @@ class TestEdgeCases:
         assert actions[0].thought == 'Let me read both files'
         assert actions[1].thought == ''
 
-    def test_tool_call_metadata_attached(self):
-        """Test that ToolCallMetadata is attached to actions."""
-        response = create_mock_response(CODEX_READ_FILE_TOOL_NAME, {'file_path': '/test.py'})
+    @pytest.mark.parametrize(
+        ('tool_name', 'arguments'),
+        [
+            (CODEX_SHELL_COMMAND_TOOL_NAME, {'command': 'pwd'}),
+            (CODEX_READ_FILE_TOOL_NAME, {'file_path': '/test.py'}),
+            (CODEX_LIST_DIR_TOOL_NAME, {'dir_path': '/workspace'}),
+            (CODEX_GREP_FILES_TOOL_NAME, {'pattern': 'TODO'}),
+            (
+                CODEX_APPLY_PATCH_TOOL_NAME,
+                {
+                    'input': (
+                        '*** Begin Patch\n*** Add File: test.txt\n+test\n*** End Patch'
+                    )
+                },
+            ),
+            (
+                CODEX_UPDATE_PLAN_TOOL_NAME,
+                {'plan': [{'step': 'Inspect', 'status': 'pending'}]},
+            ),
+        ],
+    )
+    def test_builtin_tool_call_metadata_selects_codex_body_format(
+        self,
+        tool_name,
+        arguments,
+    ):
+        """Every built-in tool selects the Codex-native result body."""
+        response = create_mock_response(tool_name, arguments)
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert actions[0].tool_call_metadata is not None
-        assert actions[0].tool_call_metadata.function_name == CODEX_READ_FILE_TOOL_NAME
+        assert actions[0].tool_call_metadata.function_name == tool_name
         assert actions[0].tool_call_metadata.tool_call_id == 'mock-tool-call-id'
+        assert actions[0].tool_call_metadata.tool_result_format == 'codex'
 
     def test_response_id_attached(self):
         """Test that response ID is attached to actions."""
-        response = create_mock_response(CODEX_READ_FILE_TOOL_NAME, {'file_path': '/test.py'})
+        response = create_mock_response(
+            CODEX_READ_FILE_TOOL_NAME, {'file_path': '/test.py'}
+        )
         actions = response_to_actions(response)
         assert actions[0].response_id == 'mock-id'

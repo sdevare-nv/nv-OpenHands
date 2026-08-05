@@ -129,6 +129,8 @@ def event_to_dict(event: 'Event') -> dict:
             d['recall_type'] = d['recall_type'].value
         if key == 'tool_call_metadata' and 'tool_call_metadata' in d:
             metadata_dict = d['tool_call_metadata'].model_dump()
+            if metadata_dict.get('tool_result_format') is None:
+                metadata_dict.pop('tool_result_format', None)
             # Include _provider_specific_fields if present
             if hasattr(d['tool_call_metadata'].model_response, '_provider_specific_fields'):
                 provider_specific_fields = d['tool_call_metadata'].model_response._provider_specific_fields
@@ -145,6 +147,10 @@ def event_to_dict(event: 'Event') -> dict:
     # Remove task_completed from serialization when it's None (backward compatibility)
     if 'task_completed' in props and props['task_completed'] is None:
         props.pop('task_completed')
+    # ``replace_all`` was added for OpenCode edits. Keep legacy edit payloads
+    # byte-for-byte stable while still serializing the non-default behavior.
+    if d.get('action') == 'edit' and props.get('replace_all') is False:
+        props.pop('replace_all')
     if 'action' in d:
         # Handle security_risk for actions - include it in args
         if 'security_risk' in props:

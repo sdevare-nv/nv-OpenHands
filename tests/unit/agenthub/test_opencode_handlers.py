@@ -9,6 +9,7 @@ import tempfile
 
 import pytest
 
+from openhands.agenthub.opencode_agent.tool_output import format_read_file
 from openhands.events.action import (
     GlobAction,
     GrepAction,
@@ -27,59 +28,54 @@ class TestOpenCodeReadHandler:
     """Tests for opencode_read handler logic."""
 
     def test_read_formats_line_numbers_correctly(self):
-        """Test that line numbers are formatted as 5-digit zero-padded with | separator."""
+        """Test the current OpenCode file envelope and line-number syntax."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write('line 1\nline 2\nline 3')
             temp_path = f.name
 
         try:
-            # Simulate reading - test the formatting logic
             with open(temp_path, 'r') as f:
                 lines = f.read().split('\n')
 
-            # Format as OpenCode does
-            formatted = [f"{str(i + 1).zfill(5)}| {line}" for i, line in enumerate(lines)]
+            formatted = format_read_file(temp_path, lines)
 
-            assert formatted[0] == '00001| line 1'
-            assert formatted[1] == '00002| line 2'
-            assert formatted[2] == '00003| line 3'
+            assert formatted == (
+                f'<path>{temp_path}</path>\n'
+                '<type>file</type>\n'
+                '<content>\n'
+                '1: line 1\n'
+                '2: line 2\n'
+                '3: line 3\n\n'
+                '(End of file - total 3 lines)\n'
+                '</content>'
+            )
         finally:
             os.unlink(temp_path)
 
     def test_read_respects_offset(self):
-        """Test that offset parameter works correctly."""
+        """OpenCode offsets are 1-based."""
         lines = [f'line {i}' for i in range(1, 101)]
-        offset = 49  # Start from line 50 (0-indexed)
-        limit = 10
+        result = format_read_file('/tmp/example', lines, offset=50, limit=10)
 
-        result = lines[offset:offset + limit]
-
-        assert result[0] == 'line 50'
-        assert len(result) == 10
+        assert '\n50: line 50\n' in result
+        assert '\n59: line 59\n\n' in result
+        assert 'Use offset=60 to continue.' in result
 
     def test_read_respects_limit(self):
         """Test that limit parameter works correctly."""
         lines = [f'line {i}' for i in range(1, 101)]
-        offset = 0
-        limit = 5
+        result = format_read_file('/tmp/example', lines, limit=5)
 
-        result = lines[offset:offset + limit]
-
-        assert len(result) == 5
-        assert result[-1] == 'line 5'
+        assert '\n1: line 1\n' in result
+        assert '\n5: line 5\n\n' in result
+        assert '\n6: line 6\n' not in result
 
     def test_read_truncates_long_lines(self):
         """Test that lines longer than MAX_LINE_LENGTH are truncated."""
-        MAX_LINE_LENGTH = 2000
         long_line = 'x' * 3000
+        result = format_read_file('/tmp/example', [long_line])
 
-        if len(long_line) > MAX_LINE_LENGTH:
-            truncated = long_line[:MAX_LINE_LENGTH] + '...'
-        else:
-            truncated = long_line
-
-        assert len(truncated) == MAX_LINE_LENGTH + 3  # +3 for '...'
-        assert truncated.endswith('...')
+        assert f"1: {'x' * 2000}... (line truncated to 2000 chars)" in result
 
     def test_binary_extension_detection(self):
         """Test binary file detection by extension."""
@@ -441,7 +437,7 @@ class TestActionProperties:
         assert action.message == 'Reading file: /test.py'
 
         action_with_offset = OpenCodeReadAction(path='/test.py', offset=50)
-        assert 'from line 51' in action_with_offset.message
+        assert 'from line 50' in action_with_offset.message
 
     def test_opencode_write_message(self):
         """Test OpenCodeWriteAction message property."""
@@ -612,4 +608,3 @@ class TestSubprocessCommandBuilding:
         assert 'find' in find_grep
         assert '-name' in find_grep
         assert include in find_grep
-
