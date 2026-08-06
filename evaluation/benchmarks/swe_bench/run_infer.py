@@ -1195,27 +1195,33 @@ source ~/.bashrc
 
         _deep_reset_to_base_commit(runtime, base_commit)
     else:
+        raw_base_commit = instance.get('base_commit', '')
+        base_commit = (
+            raw_base_commit.strip() if isinstance(raw_base_commit, str) else ''
+        )
+
         # swe-bench-ext containers typically copy flat source into the
-        # workspace with no .git directory. Bootstrap a local repo and
-        # snapshot the pristine state as `swebench_baseline` so we can diff
-        # the agent's changes against it in complete_runtime.
+        # workspace with no Git history. Bootstrap a local repo when needed,
+        # then snapshot the effective pristine HEAD as `swebench_baseline` so
+        # we can diff the agent's changes against it in complete_runtime.
         #
         # The baseline_cmd below echoes a marker line so we can detect
         # whether the repo was freshly initialized. If it was, then
         # `instance['base_commit']` (an upstream SHA) does NOT exist in
         # the local repo and passing it to _deep_reset_to_base_commit
         # would fail rev-parse. In that case, the just-created HEAD is
-        # already the correct baseline (also tagged `swebench_baseline`).
+        # already the correct baseline.
         baseline_cmd = (
             f'git config --global --add safe.directory {workspace_path} && '
             f'cd {workspace_path} && '
-            'if [ ! -d .git ]; then '
+            # `-e` recognizes both normal `.git` directories and linked
+            # worktree `.git` files without inheriting a parent repository.
+            'if [ ! -e .git ]; then '
             '  git init -q && '
             "  git config user.email 'eval@openhands.local' && "
             "  git config user.name 'OpenHands Eval' && "
             '  git add -A && '
             "  git commit -q --allow-empty -m 'swe-bench-ext baseline' && "
-            '  git tag -f swebench_baseline HEAD && '
             '  echo "__SWEBENCH_EXT_FRESH_INIT__"; '
             'else '
             '  echo "__SWEBENCH_EXT_PRE_EXISTING__"; '
@@ -1236,9 +1242,22 @@ source ~/.bashrc
         # shipped a pre-existing git history that actually contains that
         # SHA. For freshly initialized repos, our synthetic baseline IS
         # the only commit, and the upstream SHA is unreachable.
-        if instance['base_commit'] and not freshly_initialized:
-            base_commit = instance['base_commit']
+        if base_commit and not freshly_initialized:
             _deep_reset_to_base_commit(runtime, base_commit)
+
+        # Always create the tag after the optional deep reset. In particular,
+        # some OTS images ship a pre-existing repository but an empty
+        # base_commit; without this tag completion has no safe diff anchor.
+        # `-f` also replaces a stale image-provided tag with the pristine HEAD.
+        action = CmdRunAction(command='git tag -f swebench_baseline HEAD')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = _run_harness_action(runtime, action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert_and_raise(
+            isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+            f'Failed to tag swebench_baseline at the effective HEAD: {str(obs)}',
+        )
 
     if metadata.details['mode'] == 'swt-ci':
         # set up repo
@@ -1460,7 +1479,13 @@ def complete_runtime(
             f'(resolved to {obs.content.strip()}).'
         )
     else:
-        diff_base_ref = str(instance['base_commit'])
+        base_commit = instance.get('base_commit', '')
+        assert_and_raise(
+            isinstance(base_commit, str) and bool(base_commit.strip()),
+            'Failed to determine patch diff base: swebench_baseline is missing '
+            'and instance base_commit is empty.',
+        )
+        diff_base_ref = base_commit.strip()
 
     # Preserve the existing completion cleanup for nested repositories created
     # by the agent after the initialization baseline was captured.

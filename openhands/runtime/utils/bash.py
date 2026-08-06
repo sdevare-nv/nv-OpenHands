@@ -382,9 +382,14 @@ class BashSession:
             )
             _initial_window.kill()
 
-            # Configure bash to use simple PS1 and disable PS2
+            # Disable interactive history expansion before accepting agent
+            # commands. Otherwise valid code inside double quotes (for example
+            # JavaScript ``!!value`` or ``!exclude``) is rewritten by Bash.
+            # Also configure Bash to use a simple PS1 and disable PS2.
             self.pane.send_keys(
-                f'export PROMPT_COMMAND=\'export PS1="{self.PS1}"\'; export PS2=""'
+                'set +H; '
+                f'export PROMPT_COMMAND=\'export PS1="{self.PS1}"\'; '
+                'export PS2=""'
             )
             if self._wait_for_prompt(10.0) is None:
                 raise RuntimeError(
