@@ -7,6 +7,10 @@ from datasets import load_dataset
 from litellm import completion as litellm_completion
 
 import openhands.agenthub
+from evaluation.benchmarks.swe_bench import run_infer as swe_bench_run_infer
+from evaluation.benchmarks.swe_bench.patch_runtime import (
+    dispatch_patch_completion,
+)
 from evaluation.benchmarks.swe_bench.run_infer import (
     AgentFinishedCritic,
     complete_runtime,
@@ -137,7 +141,7 @@ def process_instance(
     call_async_from_sync(runtime.connect)
 
     try:
-        initialize_runtime(runtime, instance, metadata)
+        untracked_baseline = initialize_runtime(runtime, instance, metadata)
 
         message_action = get_instruction(instance, metadata)
 
@@ -163,7 +167,24 @@ def process_instance(
             raise EvalException('Fatal error detected: ' + state.last_error)
 
         # Get git patch
-        return_val = complete_runtime(runtime, instance)
+        def complete_live_patch() -> dict[str, object]:
+            from evaluation.benchmarks.swe_bench.live_utils import (
+                complete_runtime as live_complete_runtime,
+            )
+
+            return live_complete_runtime(runtime, instance)
+
+        return_val = dispatch_patch_completion(
+            swe_bench_run_infer.DATASET_TYPE,
+            untracked_baseline,
+            complete_live=complete_live_patch,
+            complete_normal=lambda baseline: complete_runtime(
+                runtime, instance, baseline
+            ),
+            missing_baseline_error=lambda: EvalException(
+                'Missing host-held pre-existing untracked paths baseline'
+            ),
+        )
         git_patch = return_val['git_patch']
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'

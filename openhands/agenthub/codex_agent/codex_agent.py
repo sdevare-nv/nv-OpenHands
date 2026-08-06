@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
 import openhands.agenthub.codex_agent.function_calling as codex_function_calling
 from openhands.agenthub.codex_agent.tools.apply_patch import ApplyPatchTool
-from openhands.agenthub.codex_agent.tools.finish import FinishTool
 from openhands.agenthub.codex_agent.tools.grep_files import GrepFilesTool
 from openhands.agenthub.codex_agent.tools.list_dir import ListDirTool
 from openhands.agenthub.codex_agent.tools.read_file import ReadFileTool
@@ -100,9 +99,22 @@ class CodexAgent(Agent):
                     self.config.system_prompt_long_horizon_path
                 )
 
+            has_prompt_override = any(
+                (
+                    self.config.custom_prompt_dir,
+                    self.config.system_prompt_path,
+                    self.config.system_prompt_long_horizon_path,
+                )
+            )
+            system_prompt_filename = (
+                self.config.resolved_system_prompt_filename
+                if has_prompt_override
+                else self.config.system_prompt_filename
+            )
+
             self._prompt_manager = PromptManager(
                 prompt_dir=prompt_dir,
-                system_prompt_filename=self.config.resolved_system_prompt_filename,
+                system_prompt_filename=system_prompt_filename,
                 template_overrides=template_overrides if template_overrides else None,
             )
 
@@ -122,10 +134,6 @@ class CodexAgent(Agent):
         # Command execution
         if self.config.enable_cmd:
             tools.append(ShellCommandTool)
-
-        # Task completion
-        if self.config.enable_finish:
-            tools.append(FinishTool)
 
         return tools
 

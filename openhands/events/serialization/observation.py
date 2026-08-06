@@ -146,6 +146,10 @@ def observation_from_dict(observation: dict) -> Observation:
             pass
         else:
             extras['metadata'] = CmdOutputMetadata()
+        # The content was already bounded by the producer. Reapplying the
+        # constructor's generic 30k-character limit here makes serialization
+        # lossy and corrupts agent-native output protocols with larger limits.
+        extras['max_content_size'] = None
 
     if observation_class is RecallObservation:
         # handle the Enum conversion

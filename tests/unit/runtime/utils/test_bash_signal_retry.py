@@ -9,8 +9,12 @@ import os
 import tempfile
 import time
 
+import psutil
+import pytest
+
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import CmdRunAction
+from openhands.events.tool import ToolCallMetadata
 from openhands.runtime.utils.bash import BashCommandStatus, BashSession
 
 
@@ -61,6 +65,53 @@ def _write_script(content: str, tmp_dir: str, name: str = "script.py") -> str:
     with open(path, "w") as f:
         f.write(content)
     return path
+
+
+def _codex_action(
+    command: str,
+    *,
+    is_input: bool = False,
+    cwd: str | None = None,
+    login: bool | None = None,
+    result_format: str = "codex",
+) -> CmdRunAction:
+    action = CmdRunAction(
+        command=command,
+        is_input=is_input,
+        cwd=cwd,
+        login=login,
+    )
+    action.tool_call_metadata = ToolCallMetadata(
+        tool_call_id="call-shell-recovery",
+        function_name="shell_command",
+        model_response={
+            "id": "response-shell-recovery",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [],
+                    }
+                }
+            ],
+            "created": 0,
+            "model": "test-model",
+            "object": "chat.completion",
+        },
+        total_calls_in_response=1,
+        tool_result_format=result_format,
+    )
+    return action
+
+
+def test_close_before_initialize_is_safe():
+    session = BashSession(work_dir=os.getcwd())
+
+    session.close()
+
+    assert session._closed is True
+    assert session.session is None
 
 
 # ---------------------------------------------------------------------------
@@ -797,5 +848,134 @@ def test_ctrl_c_subshell():
 
         obs = session.execute(CmdRunAction("echo 'subshell ok'"))
         assert "subshell ok" in obs.content
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Codex shell timeout recovery and option handling
+# ---------------------------------------------------------------------------
+
+
+def _command_children(session: BashSession):
+    pane_pid = int(
+        session.pane.cmd("display-message", "-p", "#{pane_pid}").stdout[0]
+    )
+    shell = session._find_shell_proc(psutil.Process(pane_pid))
+    return shell.children(recursive=True)
+
+
+def test_codex_next_command_recovers_after_nochange_timeout():
+    """A normal Codex call replaces, rather than queues behind, stale work."""
+    session = BashSession(work_dir=os.getcwd(), no_change_timeout_seconds=1)
+    session.initialize()
+    try:
+        timed_out = session.execute(_codex_action("sleep 30"))
+        assert timed_out.metadata.exit_code == -1
+        assert session.prev_status == BashCommandStatus.NO_CHANGE_TIMEOUT
+
+        requested = "printf 'next-command-ok'"
+        recovered = session.execute(_codex_action(requested))
+
+        assert recovered.command == requested
+        assert recovered.content == "next-command-ok"
+        assert recovered.metadata.exit_code == 0
+        assert "previous command is still running" not in recovered.metadata.suffix
+        assert session.prev_status == BashCommandStatus.COMPLETED
+        assert _command_children(session) == []
+    finally:
+        session.close()
+
+
+def test_codex_nochange_timeout_still_accepts_interactive_input():
+    session = BashSession(work_dir=os.getcwd(), no_change_timeout_seconds=1)
+    session.initialize()
+    try:
+        waiting = session.execute(
+            _codex_action("read -r value; printf 'received:%s' \"$value\"")
+        )
+        assert waiting.metadata.exit_code == -1
+        assert session.prev_status == BashCommandStatus.NO_CHANGE_TIMEOUT
+
+        completed = session.execute(
+            _codex_action("hello", is_input=True)
+        )
+        assert completed.content == "received:hello"
+        assert completed.metadata.exit_code == 0
+        assert session.prev_status == BashCommandStatus.COMPLETED
+    finally:
+        session.close()
+
+
+def test_codex_hard_timeout_recovery_cleans_process_and_output():
+    session = BashSession(work_dir=os.getcwd(), no_change_timeout_seconds=30)
+    session.initialize()
+    try:
+        action = _codex_action("while true; do echo old-output; sleep 0.1; done")
+        action.set_hard_timeout(0.4)
+        timed_out = session.execute(action)
+        assert timed_out.metadata.exit_code == -1
+        assert "old-output" in timed_out.content
+        assert session.prev_status == BashCommandStatus.HARD_TIMEOUT
+
+        assert session.recover_after_timeout() is True
+        assert session.prev_status == BashCommandStatus.COMPLETED
+        assert _command_children(session) == []
+
+        requested = "printf 'clean-output'"
+        recovered = session.execute(_codex_action(requested))
+        assert recovered.command == requested
+        assert recovered.content == "clean-output"
+        assert "old-output" not in recovered.content
+        assert recovered.metadata.exit_code == 0
+    finally:
+        session.close()
+
+
+def test_codex_default_and_workdir_preserve_persistent_environment():
+    with tempfile.TemporaryDirectory(prefix="codex cwd [quoted] ") as workdir:
+        session = BashSession(work_dir=os.getcwd(), no_change_timeout_seconds=3)
+        session.initialize()
+        try:
+            exported = session.execute(
+                CmdRunAction("export CODEX_PERSISTENT_ENV=inherited")
+            )
+            assert exported.metadata.exit_code == 0
+            original_cwd = session.cwd
+
+            default = session.execute(
+                _codex_action("printf '%s' \"$CODEX_PERSISTENT_ENV\"")
+            )
+            assert default.content.rstrip("\n") == "inherited"
+
+            requested = (
+                "printf '%s\\n%s' \"$PWD\" \"$CODEX_PERSISTENT_ENV\""
+            )
+            in_workdir = session.execute(
+                _codex_action(requested, cwd=workdir)
+            )
+            assert in_workdir.command == requested
+            assert in_workdir.content.splitlines() == [workdir, "inherited"]
+            assert session.cwd == original_cwd
+        finally:
+            session.close()
+
+
+@pytest.mark.parametrize("result_format", ["codex", "opencode"])
+def test_native_shell_pipeline_propagates_upstream_failure(
+    result_format: str,
+):
+    session = BashSession(work_dir=os.getcwd(), no_change_timeout_seconds=3)
+    session.initialize()
+    try:
+        action = _codex_action(
+            "false | tail -n 1",
+            result_format=result_format,
+        )
+
+        observation = session.execute(action)
+
+        assert observation.command == "false | tail -n 1"
+        assert observation.metadata.exit_code == 1
     finally:
         session.close()

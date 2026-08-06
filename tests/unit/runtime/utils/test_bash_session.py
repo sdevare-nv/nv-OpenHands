@@ -80,6 +80,47 @@ def test_basic_command():
     session.close()
 
 
+def test_history_expansion_is_disabled_and_prompt_metadata_survives(tmp_path):
+    """Bang operators must reach commands unchanged in the interactive shell."""
+    session = BashSession(work_dir=tmp_path)
+    session.initialize()
+
+    try:
+        # Seed interactive history so ``!!`` would have something observable
+        # to expand to if history expansion were accidentally enabled.
+        seed = session.execute(CmdRunAction("printf '%s\\n' 'history-seed'"))
+        assert seed.content == 'history-seed'
+        assert seed.metadata.exit_code == 0
+
+        # Bash expands both forms in double quotes when interactive history
+        # expansion is enabled. This mirrors agent-issued JavaScript containing
+        # expressions such as ``!!value`` and ``!exclude``.
+        obs = session.execute(
+            CmdRunAction(
+                "printf '%s\\n' \"double=!!value\" \"exclude=!exclude\""
+            )
+        )
+
+        assert obs.content == 'double=!!value\nexclude=!exclude'
+        assert obs.metadata.exit_code == 0
+        assert obs.metadata.working_dir == str(tmp_path)
+        assert obs.metadata.suffix == '\n[The command completed with exit code 0.]'
+        assert session.prev_status == BashCommandStatus.COMPLETED
+
+        # A subsequent command verifies that the custom prompt and its JSON
+        # metadata remain intact after executing literal history operators.
+        follow_up = session.execute(CmdRunAction('pwd'))
+        assert follow_up.content == str(tmp_path)
+        assert follow_up.metadata.exit_code == 0
+        assert follow_up.metadata.working_dir == str(tmp_path)
+        assert follow_up.metadata.suffix == (
+            '\n[The command completed with exit code 0.]'
+        )
+        assert session.cwd == str(tmp_path)
+    finally:
+        session.close()
+
+
 def test_long_running_command_follow_by_execute():
     session = BashSession(work_dir=os.getcwd(), no_change_timeout_seconds=2)
     session.initialize()

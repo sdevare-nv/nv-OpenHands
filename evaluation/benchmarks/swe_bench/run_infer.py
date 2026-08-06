@@ -16,6 +16,12 @@ from evaluation.benchmarks.swe_bench.binary_patch_utils import (
     remove_binary_diffs,
     remove_binary_files_from_git,
 )
+from evaluation.benchmarks.swe_bench.patch_runtime import (
+    capture_host_held_baseline,
+    dispatch_authenticated_staging,
+    dispatch_patch_completion,
+    remove_nested_git_dirs,
+)
 from evaluation.benchmarks.swe_bench.resource.mapping import (
     get_instance_resource_factor,
 )
@@ -31,8 +37,6 @@ from evaluation.utils.shared import (
     assert_and_raise,
     check_maximum_retries_exceeded,
     codeact_user_response,
-    codex_user_response,
-    opencode_user_response,
     terminus_2_user_response,
     get_default_sandbox_config_for_eval,
     get_metrics,
@@ -203,10 +207,10 @@ def set_dataset_type(dataset_name: str) -> str:
 
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
     'CodeActAgent': codeact_user_response,
-    'OpenCodeAgent': opencode_user_response,
-    'CodexAgent': codex_user_response,
     'Terminus2Agent': terminus_2_user_response,
 }
+
+AGENT_CLASSES_THAT_STOP_WITHOUT_TOOL_CALL = {'OpenCodeAgent', 'CodexAgent'}
 
 
 def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
@@ -732,6 +736,45 @@ def _run_harness_action(runtime: Runtime, action):
     return runtime.run_action(action)
 
 
+def _run_patch_export_command(
+    runtime: Runtime,
+    workspace_path: str,
+    command: str,
+    timeout: int,
+) -> Observation:
+    # Completion runs after the agent has controlled the persistent shell. A
+    # fresh static session prevents shell-local aliases, functions, and PATH
+    # changes from shadowing the Git/coreutils commands that authenticate and
+    # filter the exported patch. An explicit cwd also makes the operation
+    # independent of the persistent shell's final directory.
+    action = CmdRunAction(
+        command=command,
+        is_static=True,
+        cwd=workspace_path,
+    )
+    action.set_hard_timeout(timeout)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    observation = _run_harness_action(runtime, action)
+    logger.info(observation, extra={'msg_type': 'OBSERVATION'})
+    return observation
+
+
+def _ensure_patch_export_success(
+    observation: Observation, failure_message: str
+) -> None:
+    assert_and_raise(
+        isinstance(observation, CmdOutputObservation)
+        and observation.exit_code == 0,
+        f'{failure_message}: {str(observation)}',
+    )
+
+
+def _report_suppressed_patch_cleanup(
+    label: str, cleanup_error: BaseException
+) -> None:
+    logger.exception('%s: %r', label, cleanup_error)
+
+
 def _interrupt_stuck_command(runtime: Runtime) -> None:
     """Free the tmux session when a previous command timed out but is still running.
 
@@ -990,7 +1033,7 @@ def initialize_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required
     metadata: EvalMetadata,
-):
+) -> bytes | None:
     """Initialize the runtime for the agent.
 
     This function is called before the runtime is used to run the agent.
@@ -1152,27 +1195,33 @@ source ~/.bashrc
 
         _deep_reset_to_base_commit(runtime, base_commit)
     else:
+        raw_base_commit = instance.get('base_commit', '')
+        base_commit = (
+            raw_base_commit.strip() if isinstance(raw_base_commit, str) else ''
+        )
+
         # swe-bench-ext containers typically copy flat source into the
-        # workspace with no .git directory. Bootstrap a local repo and
-        # snapshot the pristine state as `swebench_baseline` so we can diff
-        # the agent's changes against it in complete_runtime.
+        # workspace with no Git history. Bootstrap a local repo when needed,
+        # then snapshot the effective pristine HEAD as `swebench_baseline` so
+        # we can diff the agent's changes against it in complete_runtime.
         #
         # The baseline_cmd below echoes a marker line so we can detect
         # whether the repo was freshly initialized. If it was, then
         # `instance['base_commit']` (an upstream SHA) does NOT exist in
         # the local repo and passing it to _deep_reset_to_base_commit
         # would fail rev-parse. In that case, the just-created HEAD is
-        # already the correct baseline (also tagged `swebench_baseline`).
+        # already the correct baseline.
         baseline_cmd = (
             f'git config --global --add safe.directory {workspace_path} && '
             f'cd {workspace_path} && '
-            'if [ ! -d .git ]; then '
+            # `-e` recognizes both normal `.git` directories and linked
+            # worktree `.git` files without inheriting a parent repository.
+            'if [ ! -e .git ]; then '
             '  git init -q && '
             "  git config user.email 'eval@openhands.local' && "
             "  git config user.name 'OpenHands Eval' && "
             '  git add -A && '
             "  git commit -q --allow-empty -m 'swe-bench-ext baseline' && "
-            '  git tag -f swebench_baseline HEAD && '
             '  echo "__SWEBENCH_EXT_FRESH_INIT__"; '
             'else '
             '  echo "__SWEBENCH_EXT_PRE_EXISTING__"; '
@@ -1193,9 +1242,22 @@ source ~/.bashrc
         # shipped a pre-existing git history that actually contains that
         # SHA. For freshly initialized repos, our synthetic baseline IS
         # the only commit, and the upstream SHA is unreachable.
-        if instance['base_commit'] and not freshly_initialized:
-            base_commit = instance['base_commit']
+        if base_commit and not freshly_initialized:
             _deep_reset_to_base_commit(runtime, base_commit)
+
+        # Always create the tag after the optional deep reset. In particular,
+        # some OTS images ship a pre-existing repository but an empty
+        # base_commit; without this tag completion has no safe diff anchor.
+        # `-f` also replaces a stale image-provided tag with the pristine HEAD.
+        action = CmdRunAction(command='git tag -f swebench_baseline HEAD')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = _run_harness_action(runtime, action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert_and_raise(
+            isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+            f'Failed to tag swebench_baseline at the effective HEAD: {str(obs)}',
+        )
 
     if metadata.details['mode'] == 'swt-ci':
         # set up repo
@@ -1234,9 +1296,35 @@ source ~/.bashrc
             f'Expected to find python interpreter from testbed, but got: {str(obs)}',
         )
 
+    untracked_baseline: bytes | None = None
+    if DATASET_TYPE != 'SWE-bench-Live':
+        # Git represents an untracked embedded repository as only `dir/`.
+        # Remove its metadata first so the baseline records every contained
+        # file exactly and completion cannot expose hidden fixture contents.
+        remove_nested_git_dirs(
+            lambda command, timeout: _run_patch_export_command(
+                runtime, workspace_path, command, timeout
+            ),
+            _ensure_patch_export_success,
+        )
+        # Capture pre-existing untracked paths before the agent starts, move the
+        # NUL-delimited snapshot to evaluator-host memory, then remove the
+        # runtime copy. Completion authenticates a fresh ephemeral upload.
+        untracked_baseline = capture_host_held_baseline(
+            runtime,
+            workspace_path,
+            lambda command, timeout: _run_patch_export_command(
+                runtime, workspace_path, command, timeout
+            ),
+            _ensure_patch_export_success,
+            report_cleanup_error=_report_suppressed_patch_cleanup,
+        )
+
     logger.info('-' * 30)
     logger.info('END Runtime Initialization Fn')
     logger.info('-' * 30)
+    return untracked_baseline
+
 
 def _get_workspace_path(
     instance: pd.Series, workspace_dir_name: Optional[str] = None
@@ -1260,9 +1348,11 @@ def _get_workspace_path(
         return "/testbed"
     return f"/workspace/{workspace_dir_name}"
 
+
 def complete_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+    untracked_baseline: bytes,
 ) -> dict[str, Any]:
     """Complete the runtime for the agent.
 
@@ -1333,15 +1423,13 @@ def complete_runtime(
         f'Failed to cd to {workspace_path}: {str(obs)}',
     )
 
-    action = CmdRunAction(command='git config --global core.pager ""')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = _run_harness_action(runtime, action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to git config --global core.pager "": {str(obs)}',
+    obs = _run_patch_export_command(
+        runtime,
+        workspace_path,
+        'git config --global core.pager ""',
+        600,
     )
+    _ensure_patch_export_success(obs, 'Failed to git config --global core.pager ""')
 
     # Check whether the workspace is actually a git repository. For
     # swe-bench-ext (and any other dataset where the container ships flat
@@ -1349,11 +1437,12 @@ def complete_runtime(
     # commit as `swebench_baseline`. If neither a pre-existing .git nor that
     # baseline tag is present, there's nothing we can diff against and we
     # return an empty patch instead of crashing the whole instance.
-    action = CmdRunAction(command='git rev-parse --is-inside-work-tree')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = _run_harness_action(runtime, action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    obs = _run_patch_export_command(
+        runtime,
+        workspace_path,
+        'git rev-parse --is-inside-work-tree',
+        600,
+    )
     is_git_repo = (
         isinstance(obs, CmdOutputObservation)
         and obs.exit_code == 0
@@ -1373,13 +1462,12 @@ def complete_runtime(
     # datasets that don't ship a real git history, e.g. swe-bench-ext). Fall
     # back to instance['base_commit'] for normal datasets where the container
     # already has the repo checked out at that SHA.
-    action = CmdRunAction(
-        command='git rev-parse --verify refs/tags/swebench_baseline'
+    obs = _run_patch_export_command(
+        runtime,
+        workspace_path,
+        'git rev-parse --verify refs/tags/swebench_baseline',
+        600,
     )
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = _run_harness_action(runtime, action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     if (
         isinstance(obs, CmdOutputObservation)
         and obs.exit_code == 0
@@ -1391,32 +1479,22 @@ def complete_runtime(
             f'(resolved to {obs.content.strip()}).'
         )
     else:
-        diff_base_ref = str(instance['base_commit'])
+        base_commit = instance.get('base_commit', '')
+        assert_and_raise(
+            isinstance(base_commit, str) and bool(base_commit.strip()),
+            'Failed to determine patch diff base: swebench_baseline is missing '
+            'and instance base_commit is empty.',
+        )
+        diff_base_ref = base_commit.strip()
 
-    # First check for any git repositories in subdirectories
-    action = CmdRunAction(command='find . -type d -name .git -not -path "./.git"')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = _run_harness_action(runtime, action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to find git repositories: {str(obs)}',
+    # Preserve the existing completion cleanup for nested repositories created
+    # by the agent after the initialization baseline was captured.
+    remove_nested_git_dirs(
+        lambda command, timeout: _run_patch_export_command(
+            runtime, workspace_path, command, timeout
+        ),
+        _ensure_patch_export_success,
     )
-
-    git_dirs = [p for p in obs.content.strip().split('\n') if p]
-    if git_dirs:
-        # Remove all .git directories in subdirectories
-        for git_dir in git_dirs:
-            action = CmdRunAction(command=f'rm -rf "{git_dir}"')
-            action.set_hard_timeout(600)
-            logger.info(action, extra={'msg_type': 'ACTION'})
-            obs = _run_harness_action(runtime, action)
-            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-            assert_and_raise(
-                isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-                f'Failed to remove git directory {git_dir}: {str(obs)}',
-            )
 
     # For SWE-bench_Multilingual: run language-specific gitignore script to exclude
     # compilation artifacts (e.g., .class, .o, target/) from the final patch.
@@ -1429,41 +1507,43 @@ def complete_runtime(
             # Copy the script into the runtime and execute it
             runtime.copy_to(gitignore_script_path, '/tmp/')
             script_name = os.path.basename(gitignore_script_path)
-            action = CmdRunAction(command=f'chmod +x /tmp/{script_name} && /tmp/{script_name}')
-            action.set_hard_timeout(600)
-            logger.info(action, extra={'msg_type': 'ACTION'})
-            obs = _run_harness_action(runtime, action)
-            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-            assert_and_raise(
-                obs.exit_code == 0,
-                f'Failed to run gitignore script ({LANGUAGE}.sh): {str(obs)}',
+            obs = _run_patch_export_command(
+                runtime,
+                workspace_path,
+                f'chmod +x /tmp/{script_name} && /tmp/{script_name}',
+                600,
+            )
+            _ensure_patch_export_success(
+                obs,
+                f'Failed to run gitignore script ({LANGUAGE}.sh)',
             )
         else:
             logger.info(
                 f"No gitignore script found for language '{LANGUAGE}'. Skipping."
             )
 
-    # add all files
-    action = CmdRunAction(command='git add -A')
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = _run_harness_action(runtime, action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to git add -A: {str(obs)}',
+    # Stage tracked changes and files created during the agent run, then remove
+    # paths that were already untracked when the runtime was initialized.
+    dispatch_authenticated_staging(
+        runtime,
+        workspace_path,
+        diff_base_ref,
+        untracked_baseline,
+        lambda command, timeout: _run_patch_export_command(
+            runtime, workspace_path, command, timeout
+        ),
+        _ensure_patch_export_success,
+        report_cleanup_error=_report_suppressed_patch_cleanup,
     )
 
     # Remove binary files from git staging
-    action = CmdRunAction(command=remove_binary_files_from_git())
-    action.set_hard_timeout(600)
-    logger.info(action, extra={'msg_type': 'ACTION'})
-    obs = _run_harness_action(runtime, action)
-    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to remove binary files: {str(obs)}',
+    obs = _run_patch_export_command(
+        runtime,
+        workspace_path,
+        remove_binary_files_from_git(),
+        600,
     )
+    _ensure_patch_export_success(obs, 'Failed to remove binary files')
 
     n_retries = 0
     git_patch = None
@@ -1471,18 +1551,19 @@ def complete_runtime(
     # with the language-specific gitignore script
     gitignore_exclude = " ':!.gitignore'" if DATASET_TYPE == 'SWE-bench_Multilingual' else ''
     while n_retries < 5:
-        action = CmdRunAction(
-            command=f'git diff --no-color --cached {diff_base_ref}{gitignore_exclude} > patch.diff'
+        obs = _run_patch_export_command(
+            runtime,
+            workspace_path,
+            f'git diff --no-color --cached {diff_base_ref}{gitignore_exclude} > patch.diff',
+            max(300 + 100 * n_retries, 600),
         )
-        action.set_hard_timeout(max(300 + 100 * n_retries, 600))
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = _run_harness_action(runtime, action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
         n_retries += 1
         if isinstance(obs, CmdOutputObservation):
             if obs.exit_code == 0:
                 # Read the patch file
-                action = FileReadAction(path='patch.diff')
+                action = FileReadAction(
+                    path=os.path.join(workspace_path, 'patch.diff')
+                )
                 action.set_hard_timeout(max(300 + 100 * n_retries, 600))
                 logger.info(action, extra={'msg_type': 'ACTION'})
                 obs = _run_harness_action(runtime, action)
@@ -1493,12 +1574,16 @@ def complete_runtime(
                 elif isinstance(obs, ErrorObservation):
                     # Fall back to cat "patch.diff" to get the patch
                     assert 'File could not be decoded as utf-8' in obs.content
-                    action = CmdRunAction(command='cat patch.diff')
-                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
-                    logger.info(action, extra={'msg_type': 'ACTION'})
-                    obs = _run_harness_action(runtime, action)
-                    assert isinstance(obs, CmdOutputObservation) and obs.exit_code == 0
-                    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+                    obs = _run_patch_export_command(
+                        runtime,
+                        workspace_path,
+                        'cat patch.diff',
+                        max(300 + 100 * n_retries, 600),
+                    )
+                    _ensure_patch_export_success(
+                        obs,
+                        'Failed to read non-UTF-8 patch with cat',
+                    )
                     git_patch = obs.content
                     break
                 else:
@@ -1649,7 +1734,7 @@ def process_instance(
 
     try:
         start_time = time.perf_counter()
-        initialize_runtime(runtime, instance, metadata)
+        untracked_baseline = initialize_runtime(runtime, instance, metadata)
         end_time = time.perf_counter()
         update_metrics({"initialize_runtime_time": end_time - start_time})
         print(f"init runtime: {end_time - start_time} seconds", flush = True)
@@ -1671,9 +1756,13 @@ def process_instance(
                 config=config,
                 initial_user_action=message_action,
                 runtime=runtime,
-                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
+                exit_on_message=(
                     metadata.agent_class
-                ],
+                    in AGENT_CLASSES_THAT_STOP_WITHOUT_TOOL_CALL
+                ),
+                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(
+                    metadata.agent_class
+                ),
                 replay_events=replay_events,
             )
         )
@@ -1686,13 +1775,24 @@ def process_instance(
 
         # ======= THIS IS SWE-Bench specific =======
         # Get git patch
-        if DATASET_TYPE == 'SWE-bench-Live':
+        def complete_live_patch() -> dict[str, Any]:
             from evaluation.benchmarks.swe_bench.live_utils import (
                 complete_runtime as complete_runtime_fn,
             )
-        else:
-            complete_runtime_fn = complete_runtime
-        return_val = complete_runtime_fn(runtime, instance)
+
+            return complete_runtime_fn(runtime, instance)
+
+        return_val = dispatch_patch_completion(
+            DATASET_TYPE,
+            untracked_baseline,
+            complete_live=complete_live_patch,
+            complete_normal=lambda baseline: complete_runtime(
+                runtime, instance, baseline
+            ),
+            missing_baseline_error=lambda: EvalException(
+                'Missing host-held pre-existing untracked paths baseline'
+            ),
+        )
         git_patch = return_val['git_patch']
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'

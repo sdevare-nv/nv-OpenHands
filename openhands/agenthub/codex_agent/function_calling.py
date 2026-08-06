@@ -1,6 +1,8 @@
 """Function calling implementation for Codex agent."""
 
 import json
+import math
+import os
 
 from litellm import ModelResponse
 
@@ -9,7 +11,6 @@ from openhands.agenthub.codeact_agent.function_calling import (
     set_security_risk,
 )
 from openhands.agenthub.codex_agent.tools.apply_patch import ApplyPatchTool
-from openhands.agenthub.codex_agent.tools.finish import FinishTool
 from openhands.agenthub.codex_agent.tools.grep_files import GrepFilesTool
 from openhands.agenthub.codex_agent.tools.list_dir import ListDirTool
 from openhands.agenthub.codex_agent.tools.read_file import ReadFileTool
@@ -18,16 +19,14 @@ from openhands.agenthub.codex_agent.tools.update_plan import UpdatePlanTool
 from openhands.core.exceptions import (
     FunctionCallNotExistsError,
     FunctionCallValidationError,
-    LLMContextWindowExceedError,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
     Action,
     AgentFinishAction,
     CmdRunAction,
-    MessageAction,
-    ValidationFailureAction,
     FunctionCallNotExistsAction,
+    ValidationFailureAction,
 )
 from openhands.events.action.codex import (
     CodexApplyPatchAction,
@@ -39,6 +38,17 @@ from openhands.events.action.codex import (
 from openhands.events.action.mcp import MCPAction
 from openhands.events.tool import ToolCallMetadata
 
+_CODEX_FORMATTED_TOOL_NAMES = frozenset(
+    {
+        ShellCommandTool['function']['name'],
+        ReadFileTool['function']['name'],
+        ListDirTool['function']['name'],
+        GrepFilesTool['function']['name'],
+        ApplyPatchTool['function']['name'],
+        UpdatePlanTool['function']['name'],
+    }
+)
+
 
 def response_to_actions(
     response: ModelResponse, mcp_tool_names: list[str] | None = None
@@ -48,16 +58,6 @@ def response_to_actions(
     assert len(response.choices) == 1, "Only one choice is supported for now"
     choice = response.choices[0]
     assistant_msg = choice.message
-
-    # Check if both content and tool_calls are None
-    has_content = assistant_msg.content is not None
-    has_tool_calls = hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls
-
-    if not has_content and not has_tool_calls:
-        raise LLMContextWindowExceedError(
-            "LLM returned empty response with no content and no tool calls. "
-            "This indicates the context length limit has been exceeded."
-        )
 
     if hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls:
         # Extract thought from content
@@ -81,6 +81,10 @@ def response_to_actions(
                     raise FunctionCallValidationError(
                         f'Failed to parse tool call arguments: {tool_call.function.arguments}'
                     ) from e
+                if not isinstance(arguments, dict):
+                    raise FunctionCallValidationError(
+                        'Tool call arguments must be a JSON object'
+                    )
 
                 # ================================================
                 # Shell Command
@@ -90,20 +94,75 @@ def response_to_actions(
                         raise FunctionCallValidationError(
                             f'Missing required argument "command" in tool call {tool_call.function.name}'
                         )
+                    command_arg = arguments['command']
+                    if not isinstance(command_arg, str) or '\0' in command_arg:
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'command' argument: {command_arg!r}"
+                        )
 
-                    is_input = arguments.get('is_input', 'false') == 'true'
+                    is_input_arg = arguments.get('is_input', 'false')
+                    if not isinstance(is_input_arg, str) or is_input_arg not in {
+                        'true',
+                        'false',
+                    }:
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'is_input' argument: {is_input_arg!r}"
+                        )
+
+                    workdir = arguments.get('workdir')
+                    if workdir is not None and (
+                        not isinstance(workdir, str)
+                        or not workdir.strip()
+                        or '\0' in workdir
+                        or not os.path.isabs(workdir)
+                    ):
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'workdir' argument: {workdir!r}"
+                        )
+
+                    login = arguments.get('login')
+                    if login is not None and not isinstance(login, bool):
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'login' argument: {login!r}"
+                        )
+                    if is_input_arg == 'true' and (
+                        'workdir' in arguments or 'login' in arguments
+                    ):
+                        raise FunctionCallValidationError(
+                            "'workdir' and 'login' cannot be used when 'is_input' is true"
+                        )
+
                     action = CmdRunAction(
-                        command=arguments['command'],
-                        is_input=is_input,
+                        command=command_arg,
+                        is_input=is_input_arg == 'true',
+                        cwd=workdir,
+                        login=login,
                     )
                     if 'timeout_ms' in arguments:
-                        try:
-                            timeout_s = min(float(arguments['timeout_ms']) / 1000.0, 600)
-                            action.set_hard_timeout(timeout_s)
-                        except ValueError as e:
+                        timeout_ms = arguments['timeout_ms']
+                        timeout_is_invalid = (
+                            isinstance(timeout_ms, bool)
+                            or not isinstance(timeout_ms, (int, float))
+                            or timeout_ms <= 0
+                            or (
+                                isinstance(timeout_ms, float)
+                                and not math.isfinite(timeout_ms)
+                            )
+                        )
+                        if timeout_is_invalid:
                             raise FunctionCallValidationError(
-                                f"Invalid value passed to 'timeout_ms' argument: {arguments['timeout_ms']}"
-                            ) from e
+                                f"Invalid value passed to 'timeout_ms' argument: {timeout_ms!r}"
+                            )
+                        timeout_s = (
+                            600
+                            if timeout_ms >= 600_000
+                            else timeout_ms / 1000.0
+                        )
+                        if timeout_s <= 0:
+                            raise FunctionCallValidationError(
+                                f"Invalid value passed to 'timeout_ms' argument: {timeout_ms!r}"
+                            )
+                        action.set_hard_timeout(timeout_s)
                     set_security_risk(action, arguments)
 
                 # ================================================
@@ -178,14 +237,6 @@ def response_to_actions(
                     )
 
                 # ================================================
-                # Finish
-                # ================================================
-                elif tool_call.function.name == FinishTool['function']['name']:
-                    action = AgentFinishAction(
-                        final_thought=arguments.get('message', ''),
-                    )
-
-                # ================================================
                 # MCP
                 # ================================================
                 elif mcp_tool_names and tool_call.function.name in mcp_tool_names:
@@ -227,18 +278,24 @@ def response_to_actions(
                 function_name=tool_call.function.name,
                 model_response=response,
                 total_calls_in_response=len(assistant_msg.tool_calls),
+                tool_result_format=(
+                    'codex'
+                    if tool_call.function.name in _CODEX_FORMATTED_TOOL_NAMES
+                    else None
+                ),
             )
             actions.append(action)
     else:
-        message_action = MessageAction(
-            content=str(assistant_msg.content) if assistant_msg.content else "",
-            wait_for_response=True,
+        final_thought = str(assistant_msg.content) if assistant_msg.content else ""
+        finish_action = AgentFinishAction(
+            final_thought=final_thought,
+            thought=final_thought,
         )
-        message_action.tool_call_metadata = ToolCallMetadata(
+        finish_action.tool_call_metadata = ToolCallMetadata(
             model_response=response,
             total_calls_in_response=0,
         )
-        actions.append(message_action)
+        actions.append(finish_action)
 
     # Add response id to actions
     for action in actions:

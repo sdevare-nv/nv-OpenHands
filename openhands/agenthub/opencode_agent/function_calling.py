@@ -12,7 +12,6 @@ from openhands.agenthub.codeact_agent.tools import create_cmd_run_tool
 from openhands.agenthub.opencode_agent.tools.apply_patch import APPLY_PATCH_TOOL_NAME
 from openhands.agenthub.opencode_agent.tools.bash import create_cmd_run_tool
 from openhands.agenthub.opencode_agent.tools.edit import EditTool
-from openhands.agenthub.opencode_agent.tools.finish import FinishTool
 from openhands.agenthub.opencode_agent.tools.glob import GlobTool
 from openhands.agenthub.opencode_agent.tools.grep import GrepTool
 from openhands.agenthub.opencode_agent.tools.list_dir import ListDirTool
@@ -27,7 +26,6 @@ from openhands.agenthub.opencode_agent.tools.write import WriteTool
 from openhands.core.exceptions import (
     FunctionCallNotExistsError,
     FunctionCallValidationError,
-    LLMContextWindowExceedError,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
@@ -40,7 +38,6 @@ from openhands.events.action import (
     GlobAction,
     GrepAction,
     ListDirAction,
-    MessageAction,
     OpenCodeReadAction,
     OpenCodeWriteAction,
     QuestionAction,
@@ -54,6 +51,21 @@ from openhands.events.event import FileEditSource
 from openhands.events.tool import ToolCallMetadata
 
 
+_OPENCODE_FORMATTED_TOOL_NAMES = frozenset(
+    {
+        create_cmd_run_tool()['function']['name'],
+        ReadTool['function']['name'],
+        WriteTool['function']['name'],
+        EditTool['function']['name'],
+        GlobTool['function']['name'],
+        GrepTool['function']['name'],
+        ListDirTool['function']['name'],
+        TODO_READ_TOOL_NAME,
+        TODO_WRITE_TOOL_NAME,
+    }
+)
+
+
 def response_to_actions(
     response: ModelResponse, mcp_tool_names: list[str] | None = None
 ) -> list[Action]:
@@ -62,15 +74,6 @@ def response_to_actions(
     assert len(response.choices) == 1, "Only one choice is supported for now"
     choice = response.choices[0]
     assistant_msg = choice.message
-
-    # Check if both content and tool_calls are None
-    has_content = assistant_msg.content is not None
-    has_tool_calls = hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls
-
-    if not has_content and not has_tool_calls:
-        raise LLMContextWindowExceedError(
-            "LLM returned empty response with no content and no tool calls. This indicates the context length limit has been exceeded."
-        )
 
     if hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls:
         # Extract thought from content
@@ -124,7 +127,7 @@ def response_to_actions(
                         )
                     action = OpenCodeReadAction(
                         path=arguments["file_path"],
-                        offset=arguments.get("offset", 0),
+                        offset=arguments.get("offset", 1),
                         limit=arguments.get("limit", 2000),
                     )
 
@@ -166,6 +169,7 @@ def response_to_actions(
                         command="str_replace",
                         old_str=arguments["old_string"],
                         new_str=arguments["new_string"],
+                        replace_all=arguments.get("replace_all", False),
                         impl_source=FileEditSource.OH_ACI,
                     )
 
@@ -254,14 +258,6 @@ def response_to_actions(
                     action = AgentThinkAction(thought=arguments.get('thought', ''))
 
                 # ================================================
-                # Finish
-                # ================================================
-                elif tool_call.function.name == FinishTool['function']['name']:
-                    action = AgentFinishAction(
-                        final_thought=arguments.get('message', ''),
-                    )
-
-                # ================================================
                 # MCP
                 # ================================================
                 elif mcp_tool_names and tool_call.function.name in mcp_tool_names:
@@ -301,18 +297,24 @@ def response_to_actions(
                 function_name=tool_call.function.name,
                 model_response=response,
                 total_calls_in_response=len(assistant_msg.tool_calls),
+                tool_result_format=(
+                    'opencode'
+                    if tool_call.function.name in _OPENCODE_FORMATTED_TOOL_NAMES
+                    else None
+                ),
             )
             actions.append(action)
     else:
-        message_action = MessageAction(
-            content=str(assistant_msg.content) if assistant_msg.content else "",
-            wait_for_response=True,
+        final_thought = str(assistant_msg.content) if assistant_msg.content else ""
+        finish_action = AgentFinishAction(
+            final_thought=final_thought,
+            thought=final_thought,
         )
-        message_action.tool_call_metadata = ToolCallMetadata(
+        finish_action.tool_call_metadata = ToolCallMetadata(
             model_response=response,
             total_calls_in_response=0,
         )
-        actions.append(message_action)
+        actions.append(finish_action)
 
     # Add response id to actions
     for action in actions:

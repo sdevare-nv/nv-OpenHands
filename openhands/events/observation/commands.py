@@ -112,13 +112,14 @@ class CmdOutputObservation(Observation):
         observation: str = ObservationType.RUN,
         metadata: dict[str, Any] | CmdOutputMetadata | None = None,
         hidden: bool = False,
+        max_content_size: int | None = MAX_CMD_OUTPUT_SIZE,
         **kwargs: Any,
     ) -> None:
         # Truncate content before passing it to parent
         # Hidden commands don't go through LLM/event stream, so no need to truncate
         truncate = not hidden
-        if truncate:
-            content = self._maybe_truncate(content)
+        if truncate and max_content_size is not None:
+            content = self._maybe_truncate(content, max_content_size)
 
         super().__init__(content)
 

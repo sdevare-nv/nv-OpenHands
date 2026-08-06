@@ -1,6 +1,9 @@
-"""
-Exact Python implementations of OpenCode tools.
-These implementations match the TypeScript OpenCode implementations.
+"""Legacy OpenCode helpers.
+
+The runtime body contract lives in ``tool_output.py``. Only the fuzzy edit
+replacers in this module are used by the active OpenCode runtime path; the older
+standalone read/search helpers remain for compatibility and are not canonical
+formatters.
 """
 
 import os
@@ -30,8 +33,8 @@ IGNORE_PATTERNS = [
 ]
 
 # Similarity thresholds for block anchor fallback matching
-SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.0
-MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.3
+SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.65
+MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.65
 
 # ============================================================================
 # Read Tool Implementation
@@ -227,6 +230,7 @@ def block_anchor_replacer(content: str, find: str) -> Generator[str, None, None]
     first_line_search = search_lines[0].strip()
     last_line_search = search_lines[-1].strip()
     search_block_size = len(search_lines)
+    max_line_delta = max(1, int(search_block_size * 0.25))
 
     # Collect all candidate positions
     candidates = []
@@ -236,7 +240,9 @@ def block_anchor_replacer(content: str, find: str) -> Generator[str, None, None]
 
         for j in range(i + 2, len(original_lines)):
             if original_lines[j].strip() == last_line_search:
-                candidates.append({'start_line': i, 'end_line': j})
+                actual_block_size = j - i + 1
+                if abs(actual_block_size - search_block_size) <= max_line_delta:
+                    candidates.append({'start_line': i, 'end_line': j})
                 break
 
     if not candidates:
@@ -382,13 +388,22 @@ def escape_normalized_replacer(content: str, find: str) -> Generator[str, None, 
     """Match with normalized escape sequences."""
     def unescape_string(s: str) -> str:
         replacements = {
-            '\\n': '\n', '\\t': '\t', '\\r': '\r',
-            "\\'": "'", '\\"': '"', '\\`': '`',
-            '\\\\': '\\', '\\$': '$'
+            'n': '\n',
+            't': '\t',
+            'r': '\r',
+            "'": "'",
+            '"': '"',
+            '`': '`',
+            '\\': '\\',
+            '\n': '\n',
+            '$': '$',
         }
-        for escaped, unescaped in replacements.items():
-            s = s.replace(escaped, unescaped)
-        return s
+
+        return re.sub(
+            r"\\(n|t|r|'|\"|`|\\|\n|\$)",
+            lambda match: replacements[match.group(1)],
+            s,
+        )
 
     unescaped_find = unescape_string(find)
 
@@ -488,7 +503,15 @@ def replace_with_fuzzy_matching(
     Tries multiple replacers in order until a match is found.
     """
     if old_string == new_string:
-        raise ValueError("oldString and newString must be different")
+        raise ValueError(
+            "No changes to apply: oldString and newString are identical."
+        )
+    if old_string == "":
+        raise ValueError(
+            "oldString cannot be empty when editing an existing file. Provide "
+            "the exact text to replace, or use write for an intentional "
+            "full-file replacement."
+        )
 
     not_found = True
 
@@ -512,6 +535,23 @@ def replace_with_fuzzy_matching(
 
             not_found = False
 
+            old_lines = old_string.split('\n')
+            search_lines = search.split('\n')
+            disproportionate = len(search_lines) >= max(
+                len(old_lines) + 3, len(old_lines) * 2
+            )
+            if len(old_lines) > 1:
+                old_size = len(old_string.strip())
+                disproportionate = disproportionate or len(search.strip()) > max(
+                    old_size + 500, old_size * 4
+                )
+            if disproportionate:
+                raise ValueError(
+                    "Refusing replacement because the matched span is much larger "
+                    "than oldString. Re-read the file and provide the full exact "
+                    "oldString for the intended replacement."
+                )
+
             if replace_all:
                 return content.replace(search, new_string)
 
@@ -522,11 +562,14 @@ def replace_with_fuzzy_matching(
             return content[:index] + new_string + content[index + len(search):]
 
     if not_found:
-        raise ValueError("oldString not found in content")
+        raise ValueError(
+            "Could not find oldString in the file. It must match exactly, "
+            "including whitespace, indentation, and line endings."
+        )
 
     raise ValueError(
-        "Found multiple matches for oldString. Provide more surrounding lines "
-        "in oldString to identify the correct match."
+        "Found multiple matches for oldString. Provide more surrounding context "
+        "to make the match unique."
     )
 
 
@@ -757,4 +800,3 @@ def write_file_opencode(filepath: str, content: str) -> str:
         f.write(content)
 
     return "Wrote file successfully."
-

@@ -463,7 +463,55 @@ class ConversationMemory:
         """
         message: Message
 
-        if isinstance(obs, CmdOutputObservation):
+        tool_call_metadata = getattr(obs, 'tool_call_metadata', None)
+        is_agent_native_tool_result = (
+            tool_call_metadata is not None
+            and getattr(tool_call_metadata, 'tool_result_format', None)
+            in {'opencode', 'codex'}
+        )
+
+        if is_agent_native_tool_result:
+            # The agent-native result is the complete model-visible tool body.
+            # Titles, paths, diffs, exit codes, and other runtime metadata are UI
+            # state and must not be folded into the body here. Native handlers
+            # apply their own output limits before constructing observations.
+            native_content = obs.content
+            if tool_call_metadata.tool_result_format == 'codex':
+                # Shell/read/list/grep success bodies and successful Codex
+                # state-changing observations are already bounded at their
+                # producer. All other tool outputs are failures generated after
+                # handler formatting; upstream Codex applies the 1.2x history
+                # budget to those exactly once when inserting them into history.
+                producer_bounded = isinstance(obs, CmdOutputObservation) or (
+                    isinstance(
+                        obs,
+                        (
+                            CodexApplyPatchObservation,
+                            CodexUpdatePlanObservation,
+                        ),
+                    )
+                    and obs.success
+                )
+                if not producer_bounded:
+                    # Keep this import local: importing an agent package while
+                    # ConversationMemory itself is being imported creates a
+                    # cycle through the agent registry.
+                    from openhands.agenthub.codex_agent.tool_output import (
+                        truncate_function_output as truncate_codex_function_output,
+                    )
+
+                    native_content = truncate_codex_function_output(
+                        native_content,
+                        model_name=getattr(
+                            tool_call_metadata.model_response,
+                            'model',
+                            None,
+                        ),
+                    )
+            message = Message(
+                role='user', content=[TextContent(text=native_content)]
+            )
+        elif isinstance(obs, CmdOutputObservation):
             # Note: CmdOutputObservation content is already truncated at initialization,
             # and the observation content should not have been modified after initialization
             # we keep this truncation for backwards compatibility for a time
@@ -783,7 +831,8 @@ class ConversationMemory:
             raise ValueError(f'Unknown observation type: {type(obs)}')
 
         if (
-            self.agent_config.include_turns_remaining_reminder
+            not is_agent_native_tool_result
+            and self.agent_config.include_turns_remaining_reminder
             and getattr(obs, '_turns_left', None) is not None
             and message.content
         ):
@@ -798,7 +847,7 @@ class ConversationMemory:
                 message.content.append(TextContent(text=reminder))
 
         # Update the message as tool response properly
-        if (tool_call_metadata := getattr(obs, 'tool_call_metadata', None)) is not None:
+        if tool_call_metadata is not None:
             tool_call_id_to_message[tool_call_metadata.tool_call_id] = Message(
                 role='tool',
                 content=message.content,

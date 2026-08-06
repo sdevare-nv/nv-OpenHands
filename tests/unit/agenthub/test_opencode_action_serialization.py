@@ -32,7 +32,7 @@ class TestOpenCodeReadActionSerialization:
 
         assert serialized['action'] == ActionType.OPENCODE_READ
         assert serialized['args']['path'] == '/test/file.py'
-        assert serialized['args']['offset'] == 0
+        assert serialized['args']['offset'] == 1
         assert serialized['args']['limit'] == 2000
 
     def test_serialize_with_params(self):
@@ -427,4 +427,3 @@ class TestSerializationEdgeCases:
             deserialized = event_from_dict(serialized)
 
             assert deserialized.pattern == pattern, f"Failed for pattern: {pattern}"
-

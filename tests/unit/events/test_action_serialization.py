@@ -133,6 +133,41 @@ def test_cmd_run_action_serialization_deserialization():
     serialization_deserialization(original_action_dict, CmdRunAction)
 
 
+def test_cmd_run_action_shell_options_serialization_deserialization():
+    action = CmdRunAction(
+        command='pwd',
+        cwd='/workspace/path with spaces',
+        login=False,
+    )
+
+    serialized = event_to_dict(action)
+    assert serialized['args']['cwd'] == '/workspace/path with spaces'
+    assert serialized['args']['login'] is False
+
+    restored = event_from_dict(serialized)
+    assert isinstance(restored, CmdRunAction)
+    assert restored.cwd == '/workspace/path with spaces'
+    assert restored.login is False
+
+
+def test_cmd_run_action_legacy_payload_defaults_to_existing_shell():
+    legacy = {
+        'action': 'run',
+        'args': {
+            'command': 'pwd',
+            'is_input': False,
+        },
+    }
+
+    restored = event_from_dict(legacy)
+
+    assert isinstance(restored, CmdRunAction)
+    assert restored.login is None
+    serialized_args = event_to_dict(restored)['args']
+    assert 'login' not in serialized_args
+    assert 'bypass_blacklist' not in serialized_args
+
+
 def test_browse_url_action_serialization_deserialization():
     original_action_dict = {
         'action': 'browse',
@@ -231,6 +266,37 @@ def test_file_edit_action_llm_serialization_deserialization():
         },
     }
     serialization_deserialization(original_action_dict, FileEditAction)
+
+
+def test_file_edit_action_replace_all_true_roundtrip():
+    action = FileEditAction(
+        path='/path/to/file.txt',
+        command='str_replace',
+        old_str='old',
+        new_str='new',
+        replace_all=True,
+    )
+
+    serialized = event_to_dict(action)
+    restored = event_from_dict(serialized)
+
+    assert serialized['args']['replace_all'] is True
+    assert isinstance(restored, FileEditAction)
+    assert restored.replace_all is True
+
+
+def test_file_edit_action_legacy_positional_arguments_stay_stable():
+    action = FileEditAction(
+        '/path/to/file.txt',
+        'insert',
+        None,
+        None,
+        'new text',
+        12,
+    )
+
+    assert action.insert_line == 12
+    assert action.replace_all is False
 
 
 def test_cmd_run_action_legacy_serialization():

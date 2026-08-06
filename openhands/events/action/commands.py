@@ -18,7 +18,8 @@ class CmdRunAction(Action):
     thought: str = ''
     blocking: bool = False  # if True, the command will be run in a blocking manner, but a timeout must be set through _set_hard_timeout
     is_static: bool = False  # if True, runs the command in a separate process
-    cwd: str | None = None  # current working directory, only used if is_static is True
+    cwd: str | None = None  # optional working directory for the command
+    login: bool | None = None  # whether to use login-shell semantics, when supported
     hidden: bool = (
         False  # if True, this command does not go through the LLM or event stream
     )
