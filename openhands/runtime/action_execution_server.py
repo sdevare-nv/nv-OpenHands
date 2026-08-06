@@ -1,4 +1,5 @@
 """This is the main file for the runtime client.
+
 It is responsible for executing actions received from OpenHands backend and producing observations.
 
 NOTE: this will be executed inside the docker sandbox.
@@ -13,14 +14,20 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Generator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, NamedTuple
 from zipfile import ZipFile
-import glob as glob_module
-import subprocess
+
+try:
+    import regex as _codex_regex
+except ImportError:
+    _codex_regex = None  # type: ignore[assignment]
 
 import puremagic
 from binaryornot.check import is_binary
@@ -28,9 +35,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
+
 # Use OpenCodeEditor with fuzzy matching instead of default OHEditor
 try:
-    from openhands.agenthub.opencode_agent.opencode_editor import OpenCodeEditor as OHEditor
+    from openhands.agenthub.opencode_agent.opencode_editor import (
+        OpenCodeEditor as OHEditor,
+    )
 except ImportError:
     # Fallback to standard OHEditor if OpenCodeEditor not available (e.g., in sandbox)
     from openhands_aci.editor.editor import OHEditor
@@ -157,6 +167,997 @@ def _tool_model_name(action: Action) -> str | None:
     return getattr(metadata.model_response, 'model', None)
 
 
+def _nul_argument_error(
+    value: str | os.PathLike[str] | None,
+    name: str,
+) -> str | None:
+    """Return a controlled error for an argument subprocess cannot accept."""
+    if value is None:
+        return None
+    if '\x00' in os.fspath(value):
+        return f'{name} must not contain NUL bytes'
+    return None
+
+
+def _decode_process_output(value: str | bytes) -> str:
+    """Decode subprocess output without failing on filesystem byte names."""
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return value
+
+
+def _decode_rg_json_value(payload: Any) -> str | None:
+    """Decode ripgrep's JSON text-or-base64 value without propagating errors."""
+    if not isinstance(payload, dict):
+        return None
+    text_value = payload.get('text')
+    if isinstance(text_value, str):
+        return text_value
+    bytes_value = payload.get('bytes')
+    if not isinstance(bytes_value, str):
+        return None
+    try:
+        raw_value = base64.b64decode(bytes_value, validate=True)
+    except ValueError:
+        return None
+    return raw_value.decode('utf-8', errors='replace')
+
+
+_CODEX_GREP_MAX_PATTERN_BYTES = 16_384
+_CODEX_GREP_MAX_INCLUDE_BYTES = 4_096
+_CODEX_GREP_MAX_GLOB_VARIANTS = 256
+_CODEX_GREP_MAX_GLOB_WORK = 4_096
+_CODEX_GREP_MAX_GLOB_DEPTH = 64
+_CODEX_GREP_MAX_IGNORE_FILE_BYTES = 1_048_576
+_CODEX_GREP_MAX_IGNORE_PATTERNS = 10_000
+_CODEX_GREP_MAX_IGNORE_CONTEXT_BYTES = 4_194_304
+_NATIVE_SEARCH_TIMEOUT_SECONDS = 30
+_NATIVE_SEARCH_MAX_ENTRIES = 100_000
+_NATIVE_SEARCH_MAX_OPEN_DIRECTORIES = 256
+_NATIVE_SEARCH_MAX_TRAVERSAL_PATH_BYTES = 1_048_576
+_NATIVE_SEARCH_MAX_CANDIDATES = 50_000
+_NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES = 16_777_216
+_NATIVE_SEARCH_MAX_LINE_BYTES = 1_048_576
+_OPENCODE_SEARCH_RESULT_LIMIT = 100
+
+
+class _CodexGrepPreprocessingError(ValueError):
+    """Raised when fallback grep input cannot be processed safely."""
+
+
+class _NativeSearchLimitError(RuntimeError):
+    """Raised when a native fallback exceeds a bounded traversal limit."""
+
+
+class _CodexIgnoreRule(NamedTuple):
+    base_relative: str
+    pattern: str
+    storage_bytes: int
+
+
+class _CodexIgnoreContext(NamedTuple):
+    layers: tuple[tuple[_CodexIgnoreRule, ...], ...] = ()
+    pattern_count: int = 0
+    storage_bytes: int = 0
+
+
+def _path_storage_size(path: str | os.PathLike[str]) -> int:
+    """Return the bytes needed to retain a filesystem path."""
+    return len(os.fsencode(path))
+
+
+def _iter_bounded_search_files(
+    search_path: Path,
+    *,
+    ensure_deadline: Callable[[], None],
+    should_descend: Callable[[str, _CodexIgnoreContext], bool],
+    load_ignore_context: Callable[[Path, str, _CodexIgnoreContext], _CodexIgnoreContext]
+    | None = None,
+) -> Generator[tuple[Path, str, _CodexIgnoreContext], None, None]:
+    """Yield regular files with lazy, deadline-aware ``scandir`` traversal."""
+    # Keeping one iterator per depth avoids eagerly retaining every sibling
+    # directory. Both the open-directory stack and its path storage are capped.
+    stack: list[tuple[Any, str, int, _CodexIgnoreContext]] = []
+    stack_path_bytes = 0
+    entry_count = 0
+
+    def push_directory(
+        directory: Path,
+        relative_path: str,
+        parent_context: _CodexIgnoreContext,
+    ) -> None:
+        nonlocal stack_path_bytes
+        ensure_deadline()
+        path_bytes = _path_storage_size(directory)
+        if len(stack) >= _NATIVE_SEARCH_MAX_OPEN_DIRECTORIES:
+            raise _NativeSearchLimitError(
+                'search exceeds the '
+                f'{_NATIVE_SEARCH_MAX_OPEN_DIRECTORIES}-directory traversal limit'
+            )
+        if stack_path_bytes + path_bytes > _NATIVE_SEARCH_MAX_TRAVERSAL_PATH_BYTES:
+            raise _NativeSearchLimitError(
+                'search traversal paths exceed the '
+                f'{_NATIVE_SEARCH_MAX_TRAVERSAL_PATH_BYTES}-byte memory limit'
+            )
+        context = (
+            load_ignore_context(directory, relative_path, parent_context)
+            if load_ignore_context is not None
+            else parent_context
+        )
+        ensure_deadline()
+        scanner = os.scandir(directory)
+        try:
+            ensure_deadline()
+        except BaseException:
+            scanner.close()
+            raise
+        stack.append((scanner, relative_path, path_bytes, context))
+        stack_path_bytes += path_bytes
+
+    try:
+        push_directory(search_path, '', _CodexIgnoreContext())
+        while stack:
+            ensure_deadline()
+            scanner, parent_relative, path_bytes, context = stack[-1]
+            try:
+                entry = next(scanner)
+            except StopIteration:
+                scanner.close()
+                stack.pop()
+                stack_path_bytes -= path_bytes
+                continue
+            ensure_deadline()
+            entry_count += 1
+            if entry_count > _NATIVE_SEARCH_MAX_ENTRIES:
+                raise _NativeSearchLimitError(
+                    'search enumerated more than '
+                    f'{_NATIVE_SEARCH_MAX_ENTRIES} filesystem entries'
+                )
+
+            relative_path = (
+                f'{parent_relative}/{entry.name}' if parent_relative else entry.name
+            )
+            try:
+                is_symlink = entry.is_symlink()
+                ensure_deadline()
+                if is_symlink:
+                    continue
+                is_directory = entry.is_dir(follow_symlinks=False)
+                ensure_deadline()
+                if is_directory:
+                    ensure_deadline()
+                    if should_descend(relative_path, context):
+                        push_directory(Path(entry.path), relative_path, context)
+                    continue
+                is_file = entry.is_file(follow_symlinks=False)
+                ensure_deadline()
+                if not is_file:
+                    continue
+            except OSError:
+                # Match rg --no-messages for an individual entry that races
+                # with traversal or cannot be inspected.
+                continue
+            yield Path(entry.path), relative_path.replace(os.sep, '/'), context
+    finally:
+        for scanner, _, _, _ in reversed(stack):
+            scanner.close()
+
+
+def _iter_bounded_binary_lines(
+    source: Any,
+    *,
+    ensure_deadline: Callable[[], None],
+) -> Generator[tuple[int, bytes], None, None]:
+    """Yield file lines without allocating an unbounded newline-free line."""
+    line_number = 0
+    while True:
+        ensure_deadline()
+        raw_text = source.readline(_NATIVE_SEARCH_MAX_LINE_BYTES + 1)
+        ensure_deadline()
+        if not raw_text:
+            return
+        if len(raw_text) > _NATIVE_SEARCH_MAX_LINE_BYTES:
+            raise _NativeSearchLimitError(
+                'file contains a line exceeding the '
+                f'{_NATIVE_SEARCH_MAX_LINE_BYTES}-byte fallback limit'
+            )
+        line_number += 1
+        yield line_number, raw_text
+
+
+def _ensure_codex_grep_before_deadline(deadline: float | None) -> None:
+    if deadline is not None and _codex_grep_monotonic() >= deadline:
+        raise TimeoutError
+
+
+def _validate_codex_grep_input(
+    value: str,
+    *,
+    name: str,
+    max_bytes: int,
+    deadline: float,
+) -> None:
+    """Bound fallback inputs before regex or glob preprocessing."""
+    _ensure_codex_grep_before_deadline(deadline)
+    if len(value) > max_bytes:
+        raise _CodexGrepPreprocessingError(
+            f'{name} exceeds the {max_bytes}-byte fallback limit'
+        )
+    try:
+        encoded_size = len(value.encode('utf-8'))
+    except UnicodeEncodeError as error:
+        raise _CodexGrepPreprocessingError(f'{name} is not valid UTF-8') from error
+    if encoded_size > max_bytes:
+        raise _CodexGrepPreprocessingError(
+            f'{name} exceeds the {max_bytes}-byte fallback limit'
+        )
+    _ensure_codex_grep_before_deadline(deadline)
+
+
+def _expand_codex_include_glob(
+    pattern: str,
+    *,
+    deadline: float | None = None,
+    max_variants: int = _CODEX_GREP_MAX_GLOB_VARIANTS,
+) -> list[str]:
+    """Expand rg brace and zero-directory ``**`` forms within strict caps."""
+    variants: set[str] = set()
+    expanded_brace_states: set[str] = set()
+    work = 0
+
+    def consume_work() -> None:
+        nonlocal work
+        work += 1
+        if work > _CODEX_GREP_MAX_GLOB_WORK:
+            raise _CodexGrepPreprocessingError(
+                'include expansion exceeds the '
+                f'{_CODEX_GREP_MAX_GLOB_WORK}-step fallback work limit'
+            )
+
+    def add_variant(variant: str) -> None:
+        variants.add(variant)
+        if len(variants) > max_variants:
+            raise _CodexGrepPreprocessingError(
+                f'include expands to more than {max_variants} glob variants'
+            )
+
+    def expand_braces(current: str, depth: int, logical_variants: int) -> None:
+        _ensure_codex_grep_before_deadline(deadline)
+        consume_work()
+        if depth > _CODEX_GREP_MAX_GLOB_DEPTH:
+            raise _CodexGrepPreprocessingError(
+                'include glob nesting exceeds the fallback limit'
+            )
+        if current in expanded_brace_states:
+            return
+        expanded_brace_states.add(current)
+        brace = re.search(r'\{([^{}]*,[^{}]*)\}', current)
+        if brace is None:
+            expand_double_stars(current)
+            return
+        # Syntactically repeated alternatives do not create distinct glob
+        # variants and must not inflate the logical expansion bound.
+        options = list(dict.fromkeys(brace.group(1).split(',')))
+        if logical_variants > max_variants // len(options):
+            raise _CodexGrepPreprocessingError(
+                f'include expands to more than {max_variants} glob variants'
+            )
+        next_logical_variants = logical_variants * len(options)
+        for option in options:
+            consume_work()
+            expand_braces(
+                current[: brace.start()] + option + current[brace.end() :],
+                depth + 1,
+                next_logical_variants,
+            )
+
+    def expand_double_stars(current: str) -> None:
+        pending = [current]
+        seen = {current}
+        while pending:
+            _ensure_codex_grep_before_deadline(deadline)
+            consume_work()
+            candidate = pending.pop()
+            add_variant(candidate)
+            for marker in (match.start() for match in re.finditer(r'\*\*/', candidate)):
+                consume_work()
+                without_marker = candidate[:marker] + candidate[marker + 3 :]
+                if without_marker not in seen:
+                    seen.add(without_marker)
+                    if len(seen) > max_variants:
+                        raise _CodexGrepPreprocessingError(
+                            f'include expands to more than {max_variants} glob variants'
+                        )
+                    pending.append(without_marker)
+
+    expand_braces(pattern, 0, 1)
+    return sorted(variants)
+
+
+def _prepare_codex_include(
+    include: str | None,
+    *,
+    deadline: float | None = None,
+) -> tuple[bool, tuple[re.Pattern[str], ...]] | None:
+    """Preprocess one include exactly once for a fallback search."""
+    if include is None:
+        return None
+
+    negated = include.startswith('!')
+    pattern = include[1:] if negated else include
+    variants = tuple(
+        re.compile(
+            _translate_codex_glob(
+                variant if '/' in variant else f'**/{variant}',
+                deadline=deadline,
+            )
+        )
+        for variant in _expand_codex_include_glob(pattern, deadline=deadline)
+    )
+    _ensure_codex_grep_before_deadline(deadline)
+    return negated, variants
+
+
+def _translate_codex_glob(
+    pattern: str,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Translate an rg-style path glob into an anchored safe regex."""
+    if pattern.startswith('/'):
+        pattern = pattern[1:]
+    pieces = [r'\A']
+    index = 0
+    while index < len(pattern):
+        _ensure_codex_grep_before_deadline(deadline)
+        if pattern.startswith('**/', index):
+            pieces.append(r'(?:[^/]+/)*')
+            index += 3
+            continue
+        if pattern.startswith('**', index):
+            pieces.append(r'.*')
+            index += 2
+            continue
+
+        character = pattern[index]
+        if character == '*':
+            pieces.append(r'[^/]*')
+        elif character == '?':
+            pieces.append(r'[^/]')
+        elif character == '[':
+            closing = index + 1
+            if closing < len(pattern) and pattern[closing] in ('!', ']'):
+                closing += 1
+            while closing < len(pattern) and pattern[closing] != ']':
+                closing += 1
+            if closing == len(pattern):
+                pieces.append(r'\[')
+            else:
+                shell_class = pattern[index : closing + 1]
+                pieces.append(fnmatch.translate(shell_class)[4:-3])
+                index = closing
+        else:
+            pieces.append(re.escape(character))
+        index += 1
+    pieces.append(r'\Z')
+    _ensure_codex_grep_before_deadline(deadline)
+    return ''.join(pieces)
+
+
+def _matches_prepared_codex_include(
+    relative_path: str,
+    prepared: tuple[bool, tuple[re.Pattern[str], ...]] | None,
+) -> bool:
+    """Match a slash-normalized path against a preprocessed include."""
+    if prepared is None:
+        return True
+    negated, variants = prepared
+    matched = any(variant.match(relative_path) for variant in variants)
+    return not matched if negated else matched
+
+
+def _matches_codex_include(
+    relative_path: str,
+    include: str | None,
+    *,
+    deadline: float | None = None,
+) -> bool:
+    """Match an rg-style include glob against a slash-normalized path."""
+    return _matches_prepared_codex_include(
+        relative_path,
+        _prepare_codex_include(include, deadline=deadline),
+    )
+
+
+def _positive_codex_include_matches(
+    relative_path: str,
+    include: str | None,
+    prepared: tuple[bool, tuple[re.Pattern[str], ...]] | None,
+) -> bool:
+    """Return whether a positive rg glob explicitly selects one path."""
+    return (
+        include is not None
+        and not include.startswith('!')
+        and _matches_prepared_codex_include(relative_path, prepared)
+    )
+
+
+def _load_codex_ignore_patterns(
+    directory: Path,
+    *,
+    base_relative: str = '',
+    inherited: _CodexIgnoreContext | None = None,
+    deadline: float | None = None,
+) -> _CodexIgnoreContext:
+    """Add one directory's bounded ignore rules to its inherited context."""
+    context = inherited or _CodexIgnoreContext()
+    local_rules: list[_CodexIgnoreRule] = []
+    local_storage_bytes = 0
+    for ignore_name in ('.gitignore', '.ignore', '.rgignore'):
+        _ensure_codex_grep_before_deadline(deadline)
+        ignore_path = directory / ignore_name
+        ignore_display = (
+            f'{base_relative}/{ignore_name}' if base_relative else ignore_name
+        )
+        try:
+            if not ignore_path.is_file():
+                continue
+            source = ignore_path.open('rb')
+        except OSError:
+            continue
+        consumed_bytes = 0
+        with source:
+            while True:
+                _ensure_codex_grep_before_deadline(deadline)
+                line = source.readline(_CODEX_GREP_MAX_INCLUDE_BYTES + 1)
+                if not line:
+                    break
+                consumed_bytes += len(line)
+                if consumed_bytes > _CODEX_GREP_MAX_IGNORE_FILE_BYTES:
+                    raise _CodexGrepPreprocessingError(
+                        f'{ignore_display} exceeds the '
+                        f'{_CODEX_GREP_MAX_IGNORE_FILE_BYTES}-byte '
+                        'fallback limit'
+                    )
+                if len(line) > _CODEX_GREP_MAX_INCLUDE_BYTES and not line.endswith(
+                    (b'\n', b'\r')
+                ):
+                    raise _CodexGrepPreprocessingError(
+                        f'{ignore_display} contains a line exceeding the '
+                        f'{_CODEX_GREP_MAX_INCLUDE_BYTES}-byte '
+                        'fallback limit'
+                    )
+                decoded = line.decode('utf-8', errors='replace').rstrip('\r\n')
+                if not decoded or decoded.lstrip().startswith('#'):
+                    continue
+                storage_bytes = len(os.fsencode(base_relative)) + len(
+                    decoded.encode('utf-8')
+                )
+                local_rules.append(
+                    _CodexIgnoreRule(base_relative, decoded, storage_bytes)
+                )
+                local_storage_bytes += storage_bytes
+                if (
+                    context.pattern_count + len(local_rules)
+                    > _CODEX_GREP_MAX_IGNORE_PATTERNS
+                ):
+                    raise _CodexGrepPreprocessingError(
+                        'ignore files contain more than '
+                        f'{_CODEX_GREP_MAX_IGNORE_PATTERNS} patterns'
+                    )
+                if (
+                    context.storage_bytes + local_storage_bytes
+                    > _CODEX_GREP_MAX_IGNORE_CONTEXT_BYTES
+                ):
+                    raise _CodexGrepPreprocessingError(
+                        'active ignore rules exceed the '
+                        f'{_CODEX_GREP_MAX_IGNORE_CONTEXT_BYTES}-byte memory limit'
+                    )
+    if not local_rules:
+        return context
+    return _CodexIgnoreContext(
+        context.layers + (tuple(local_rules),),
+        context.pattern_count + len(local_rules),
+        context.storage_bytes + local_storage_bytes,
+    )
+
+
+def _matches_codex_ignore(
+    relative_path: str,
+    *,
+    is_directory: bool,
+    patterns: _CodexIgnoreContext,
+    deadline: float | None = None,
+) -> bool:
+    """Apply common gitignore forms without requiring another dependency."""
+    ignored = False
+    for layer in patterns.layers:
+        for rule in layer:
+            _ensure_codex_grep_before_deadline(deadline)
+            if rule.base_relative:
+                prefix = f'{rule.base_relative}/'
+                if not relative_path.startswith(prefix):
+                    continue
+                local_path = relative_path[len(prefix) :]
+            else:
+                local_path = relative_path
+
+            raw_pattern = rule.pattern
+            negated = raw_pattern.startswith('!')
+            pattern = raw_pattern[1:] if negated else raw_pattern
+            directory_only = pattern.endswith('/')
+            if directory_only and not is_directory:
+                continue
+            pattern = pattern.rstrip('/')
+            if not pattern:
+                continue
+
+            anchored = pattern.startswith('/')
+            pattern = pattern.lstrip('/')
+            if not anchored and '/' not in pattern:
+                # A slashless pattern applies to a component at any depth
+                # below the directory containing its ignore file.
+                matched = fnmatch.fnmatchcase(local_path.rsplit('/', 1)[-1], pattern)
+            else:
+                include_pattern = f'/{pattern}' if anchored else pattern
+                matched = _matches_codex_include(
+                    local_path,
+                    include_pattern,
+                    deadline=deadline,
+                )
+            if matched:
+                ignored = not negated
+    return ignored
+
+
+_codex_grep_monotonic = time.monotonic
+
+
+class _CodexGrepRegexUnavailableError(RuntimeError):
+    """Raised when the safe regex engine is unavailable for fallback grep."""
+
+
+_CODEX_GREP_REGEX_ERROR = _codex_regex.error if _codex_regex is not None else re.error
+
+
+def _fallback_codex_grep_files(
+    search_path: Path,
+    pattern: str,
+    include: str | None,
+    limit: int,
+    *,
+    timeout_seconds: float = 30,
+) -> list[str]:
+    """Find matching files without relying on an external search binary."""
+    deadline = _codex_grep_monotonic() + timeout_seconds
+    _validate_codex_grep_input(
+        pattern,
+        name='pattern',
+        max_bytes=_CODEX_GREP_MAX_PATTERN_BYTES,
+        deadline=deadline,
+    )
+    if include is not None:
+        _validate_codex_grep_input(
+            include,
+            name='include',
+            max_bytes=_CODEX_GREP_MAX_INCLUDE_BYTES,
+            deadline=deadline,
+        )
+    if _codex_regex is None:
+        raise _CodexGrepRegexUnavailableError(
+            "the 'regex' package is required when ripgrep is unavailable"
+        )
+    try:
+        matcher = _codex_regex.compile(pattern)
+    except RecursionError as error:
+        raise _CodexGrepPreprocessingError(
+            'pattern nesting exceeds the fallback limit'
+        ) from error
+    _ensure_codex_grep_before_deadline(deadline)
+    prepared_include = _prepare_codex_include(
+        include,
+        deadline=deadline,
+    )
+    _ensure_codex_grep_before_deadline(deadline)
+    candidates: list[tuple[int, str, Path]] = []
+    candidate_path_bytes = 0
+    explicit_file = search_path.is_file()
+
+    def add_candidate(candidate: Path, relative_path: str) -> None:
+        nonlocal candidate_path_bytes
+        _ensure_codex_grep_before_deadline(deadline)
+        if not _matches_prepared_codex_include(relative_path, prepared_include):
+            return
+        try:
+            display_path = str(candidate)
+            display_path.encode('utf-8')
+            modified_ns = candidate.stat().st_mtime_ns
+        except (OSError, UnicodeEncodeError):
+            return
+        if len(candidates) >= _NATIVE_SEARCH_MAX_CANDIDATES:
+            raise _NativeSearchLimitError(
+                'search found more than '
+                f'{_NATIVE_SEARCH_MAX_CANDIDATES} candidate files'
+            )
+        path_bytes = _path_storage_size(display_path)
+        if candidate_path_bytes + path_bytes > _NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES:
+            raise _NativeSearchLimitError(
+                'candidate paths exceed the '
+                f'{_NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES}-byte memory limit'
+            )
+        candidates.append((modified_ns, display_path, candidate))
+        candidate_path_bytes += path_bytes
+
+    if explicit_file:
+        add_candidate(search_path, search_path.name)
+    else:
+
+        def should_descend(
+            relative_path: str,
+            ignore_context: _CodexIgnoreContext,
+        ) -> bool:
+            directory = relative_path.rsplit('/', 1)[-1]
+            if directory == '.git':
+                return False
+            explicitly_selected = _positive_codex_include_matches(
+                relative_path,
+                include,
+                prepared_include,
+            )
+            # A positive rg glob can whitelist a hidden directory when the
+            # directory path itself matches (for example ``*`` or ``**/*``).
+            # Without that explicit selection, rg keeps hidden directories
+            # out of the traversal. Directory symlinks are rejected earlier.
+            if directory.startswith('.') and not explicitly_selected:
+                return False
+            ignored = _matches_codex_ignore(
+                relative_path,
+                is_directory=True,
+                patterns=ignore_context,
+                deadline=deadline,
+            )
+            return not ignored or explicitly_selected
+
+        def load_ignore_context(
+            directory: Path,
+            base_relative: str,
+            inherited: _CodexIgnoreContext,
+        ) -> _CodexIgnoreContext:
+            return _load_codex_ignore_patterns(
+                directory,
+                base_relative=base_relative,
+                inherited=inherited,
+                deadline=deadline,
+            )
+
+        for candidate, relative_path, ignore_context in _iter_bounded_search_files(
+            search_path,
+            ensure_deadline=lambda: _ensure_codex_grep_before_deadline(deadline),
+            should_descend=should_descend,
+            load_ignore_context=load_ignore_context,
+        ):
+            filename = relative_path.rsplit('/', 1)[-1]
+            explicitly_selected = _positive_codex_include_matches(
+                relative_path,
+                include,
+                prepared_include,
+            )
+            # A positive rg glob may explicitly select a hidden file.
+            if filename.startswith('.') and not explicitly_selected:
+                continue
+            ignored = _matches_codex_ignore(
+                relative_path,
+                is_directory=False,
+                patterns=ignore_context,
+                deadline=deadline,
+            )
+            if ignored and not explicitly_selected:
+                continue
+            add_candidate(candidate, relative_path)
+
+    # Newest first, with lexical order as the deterministic mtime tie-breaker.
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    matches: list[str] = []
+    for _, display_path, candidate in candidates:
+        if _codex_grep_monotonic() >= deadline:
+            raise TimeoutError
+        try:
+            with candidate.open('rb') as source:
+                matched = False
+                binary = False
+                for _, line in _iter_bounded_binary_lines(
+                    source,
+                    ensure_deadline=lambda: _ensure_codex_grep_before_deadline(
+                        deadline
+                    ),
+                ):
+                    if not explicit_file and b'\x00' in line:
+                        binary = True
+                        break
+                    remaining_seconds = deadline - _codex_grep_monotonic()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError
+                    if matcher.search(
+                        line.decode('utf-8', errors='replace'),
+                        timeout=remaining_seconds,
+                    ):
+                        matched = True
+                if matched and not binary:
+                    matches.append(display_path)
+        except TimeoutError:
+            raise
+        except OSError:
+            # Match rg --no-messages: an unreadable individual file does not
+            # add noise to otherwise useful search results.
+            continue
+        if len(matches) == limit:
+            break
+    return matches
+
+
+def _fallback_opencode_glob(
+    search_path: Path,
+    pattern: str,
+    *,
+    timeout_seconds: float = 30,
+) -> list[str]:
+    """Find OpenCode glob results with a bounded native traversal."""
+    deadline = _codex_grep_monotonic() + timeout_seconds
+    _validate_codex_grep_input(
+        pattern,
+        name='pattern',
+        max_bytes=_CODEX_GREP_MAX_INCLUDE_BYTES,
+        deadline=deadline,
+    )
+    prepared_pattern = _prepare_codex_include(pattern, deadline=deadline)
+    files: list[str] = []
+    result_path_bytes = 0
+
+    def should_descend(
+        relative_path: str,
+        ignore_context: _CodexIgnoreContext,
+    ) -> bool:
+        directory_name = relative_path.rsplit('/', 1)[-1]
+        if directory_name == '.git':
+            return False
+        explicitly_selected = _positive_codex_include_matches(
+            relative_path,
+            pattern,
+            prepared_pattern,
+        )
+        # A positive rg glob can whitelist a hidden directory only when the
+        # directory path itself matches (for example ``*`` or ``**/*``).
+        if directory_name.startswith('.') and not explicitly_selected:
+            return False
+        ignored = _matches_codex_ignore(
+            relative_path,
+            is_directory=True,
+            patterns=ignore_context,
+            deadline=deadline,
+        )
+        return not ignored or explicitly_selected
+
+    def load_ignore_context(
+        directory: Path,
+        base_relative: str,
+        inherited: _CodexIgnoreContext,
+    ) -> _CodexIgnoreContext:
+        return _load_codex_ignore_patterns(
+            directory,
+            base_relative=base_relative,
+            inherited=inherited,
+            deadline=deadline,
+        )
+
+    traversal = _iter_bounded_search_files(
+        search_path,
+        ensure_deadline=lambda: _ensure_codex_grep_before_deadline(deadline),
+        should_descend=should_descend,
+        load_ignore_context=load_ignore_context,
+    )
+    try:
+        for candidate, relative_path, ignore_context in traversal:
+            matches_pattern = _matches_prepared_codex_include(
+                relative_path,
+                prepared_pattern,
+            )
+            if not matches_pattern:
+                continue
+            explicitly_selected = _positive_codex_include_matches(
+                relative_path,
+                pattern,
+                prepared_pattern,
+            )
+            if (
+                relative_path.rsplit('/', 1)[-1].startswith('.')
+                and not explicitly_selected
+            ):
+                continue
+            ignored = _matches_codex_ignore(
+                relative_path,
+                is_directory=False,
+                patterns=ignore_context,
+                deadline=deadline,
+            )
+            if ignored and not explicitly_selected:
+                continue
+            display_path = os.fsencode(candidate).decode('utf-8', errors='replace')
+            path_bytes = _path_storage_size(display_path)
+            if result_path_bytes + path_bytes > _NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES:
+                raise _NativeSearchLimitError(
+                    'result paths exceed the '
+                    f'{_NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES}-byte memory limit'
+                )
+            files.append(display_path)
+            result_path_bytes += path_bytes
+            if len(files) == _OPENCODE_SEARCH_RESULT_LIMIT:
+                break
+    finally:
+        traversal.close()
+    return files
+
+
+def _fallback_opencode_grep(
+    search_path: Path,
+    pattern: str,
+    include: str | None,
+    *,
+    timeout_seconds: float = 30,
+) -> list[GrepMatch]:
+    """Find OpenCode grep matches with bounded traversal and regex timeouts."""
+    deadline = _codex_grep_monotonic() + timeout_seconds
+    include = include or None
+    _validate_codex_grep_input(
+        pattern,
+        name='pattern',
+        max_bytes=_CODEX_GREP_MAX_PATTERN_BYTES,
+        deadline=deadline,
+    )
+    if include is not None:
+        _validate_codex_grep_input(
+            include,
+            name='include',
+            max_bytes=_CODEX_GREP_MAX_INCLUDE_BYTES,
+            deadline=deadline,
+        )
+    if _codex_regex is None:
+        raise _CodexGrepRegexUnavailableError(
+            "the 'regex' package is required when ripgrep is unavailable"
+        )
+    try:
+        matcher = _codex_regex.compile(pattern)
+    except RecursionError as error:
+        raise _CodexGrepPreprocessingError(
+            'pattern nesting exceeds the fallback limit'
+        ) from error
+    _ensure_codex_grep_before_deadline(deadline)
+    prepared_include = _prepare_codex_include(include, deadline=deadline)
+    matches: list[GrepMatch] = []
+    result_path_bytes = 0
+    search_is_directory = search_path.is_dir()
+
+    def should_descend(
+        relative_path: str,
+        ignore_context: _CodexIgnoreContext,
+    ) -> bool:
+        if relative_path.rsplit('/', 1)[-1] == '.git':
+            return False
+        explicitly_selected = _positive_codex_include_matches(
+            relative_path,
+            include,
+            prepared_include,
+        )
+        ignored = _matches_codex_ignore(
+            relative_path,
+            is_directory=True,
+            patterns=ignore_context,
+            deadline=deadline,
+        )
+        return not ignored or explicitly_selected
+
+    def load_ignore_context(
+        directory: Path,
+        base_relative: str,
+        inherited: _CodexIgnoreContext,
+    ) -> _CodexIgnoreContext:
+        return _load_codex_ignore_patterns(
+            directory,
+            base_relative=base_relative,
+            inherited=inherited,
+            deadline=deadline,
+        )
+
+    if search_is_directory:
+        traversal = _iter_bounded_search_files(
+            search_path,
+            ensure_deadline=lambda: _ensure_codex_grep_before_deadline(deadline),
+            should_descend=should_descend,
+            load_ignore_context=load_ignore_context,
+        )
+    else:
+        traversal = None
+
+    try:
+        candidates = (
+            traversal
+            if traversal is not None
+            else iter(((search_path, search_path.name, _CodexIgnoreContext()),))
+        )
+        for candidate, relative_path, ignore_context in candidates:
+            _ensure_codex_grep_before_deadline(deadline)
+            if not _matches_prepared_codex_include(
+                relative_path,
+                prepared_include,
+            ):
+                continue
+            explicitly_selected = _positive_codex_include_matches(
+                relative_path,
+                include,
+                prepared_include,
+            )
+            if search_is_directory:
+                ignored = _matches_codex_ignore(
+                    relative_path,
+                    is_directory=False,
+                    patterns=ignore_context,
+                    deadline=deadline,
+                )
+                if ignored and not explicitly_selected:
+                    continue
+            display_path = os.fsencode(candidate).decode('utf-8', errors='replace')
+            file_matches: list[GrepMatch] = []
+            binary = False
+            try:
+                with candidate.open('rb') as source:
+                    for line_number, raw_text in _iter_bounded_binary_lines(
+                        source,
+                        ensure_deadline=lambda: _ensure_codex_grep_before_deadline(
+                            deadline
+                        ),
+                    ):
+                        if b'\x00' in raw_text:
+                            binary = True
+                            break
+                        remaining_seconds = deadline - _codex_grep_monotonic()
+                        if remaining_seconds <= 0:
+                            raise TimeoutError
+                        text = raw_text.decode('utf-8', errors='replace')
+                        if matcher.search(text, timeout=remaining_seconds):
+                            file_matches.append(
+                                GrepMatch(display_path, line_number, text)
+                            )
+                            if (
+                                len(matches) + len(file_matches)
+                                == _OPENCODE_SEARCH_RESULT_LIMIT
+                            ):
+                                break
+            except TimeoutError:
+                raise
+            except OSError:
+                continue
+            if binary:
+                continue
+            if file_matches:
+                path_bytes = _path_storage_size(display_path)
+                if (
+                    result_path_bytes + path_bytes
+                    > _NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES
+                ):
+                    raise _NativeSearchLimitError(
+                        'result paths exceed the '
+                        f'{_NATIVE_SEARCH_MAX_CANDIDATE_PATH_BYTES}-byte memory limit'
+                    )
+                matches.extend(file_matches)
+                result_path_bytes += path_bytes
+            if len(matches) == _OPENCODE_SEARCH_RESULT_LIMIT:
+                break
+    finally:
+        if traversal is not None:
+            traversal.close()
+    return matches
+
+
 def verify_api_key(api_key: str = Depends(api_key_header)):
     if SESSION_API_KEY and api_key != SESSION_API_KEY:
         raise HTTPException(status_code=403, detail='Invalid API Key')
@@ -231,6 +1232,7 @@ def _execute_file_editor(
 
 class ActionExecutor:
     """ActionExecutor is running inside docker sandbox.
+
     It is responsible for executing actions received from OpenHands backend and producing observations.
     """
 
@@ -454,12 +1456,29 @@ class ActionExecutor:
     ) -> CmdOutputObservation | ErrorObservation:
         try:
             bash_session = self.bash_session
+            static_session = None
             if action.is_static:
                 bash_session = self._create_bash_session(action.cwd)
+                static_session = bash_session
             assert bash_session is not None
             started_at = time.monotonic()
-            obs = await call_sync_from_async(bash_session.execute, action)
-            duration_seconds = time.monotonic() - started_at
+            primary_error: BaseException | None = None
+            try:
+                obs = await call_sync_from_async(bash_session.execute, action)
+                duration_seconds = time.monotonic() - started_at
+            except BaseException as error:
+                primary_error = error
+                raise
+            finally:
+                if static_session is not None:
+                    try:
+                        await call_sync_from_async(static_session.close)
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.exception(
+                            'Error closing static shell session after command interruption'
+                        )
             result_format = (
                 getattr(action.tool_call_metadata, 'tool_result_format', None)
                 if action.tool_call_metadata is not None
@@ -519,6 +1538,13 @@ class ActionExecutor:
                     # duration and floors sub-millisecond precision.
                     timed_out_ms = int(max(duration_seconds, 0.0) * 1000)
                     exit_code = 124
+                    if not action.is_static and hasattr(
+                        bash_session, 'recover_after_timeout'
+                    ):
+                        # A hard timeout is terminal for Codex's shell call.
+                        # Reclaim the persistent pane before returning so the
+                        # next call cannot inherit output or a live process.
+                        await call_sync_from_async(bash_session.recover_after_timeout)
 
                 obs.content = format_codex_shell_output(
                     raw_output,
@@ -731,9 +1757,7 @@ class ActionExecutor:
             if old_string and not os.path.exists(filepath):
                 return ErrorObservation(f'File {filepath} not found')
             if os.path.isdir(filepath):
-                return ErrorObservation(
-                    f'Path is a directory, not a file: {filepath}'
-                )
+                return ErrorObservation(f'Path is a directory, not a file: {filepath}')
 
             if old_string == '':
                 old_content = ''
@@ -752,12 +1776,8 @@ class ActionExecutor:
                 except OSError as exc:
                     return ErrorObservation(str(exc))
                 ending = '\r\n' if '\r\n' in old_content else '\n'
-                normalized_old = old_string.replace('\r\n', '\n').replace(
-                    '\n', ending
-                )
-                normalized_new = new_string.replace('\r\n', '\n').replace(
-                    '\n', ending
-                )
+                normalized_old = old_string.replace('\r\n', '\n').replace('\n', ending)
+                normalized_new = new_string.replace('\r\n', '\n').replace('\n', ending)
                 try:
                     new_content = replace_with_fuzzy_matching(
                         old_content,
@@ -821,10 +1841,34 @@ class ActionExecutor:
         filepath = os.path.abspath(self._resolve_path(action.path, working_dir))
 
         BINARY_EXTENSIONS = {
-            '.zip', '.tar', '.gz', '.exe', '.dll', '.so', '.class', '.jar',
-            '.war', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-            '.odt', '.ods', '.odp', '.bin', '.dat', '.obj', '.o', '.a',
-            '.lib', '.wasm', '.pyc', '.pyo',
+            '.zip',
+            '.tar',
+            '.gz',
+            '.exe',
+            '.dll',
+            '.so',
+            '.class',
+            '.jar',
+            '.war',
+            '.7z',
+            '.doc',
+            '.docx',
+            '.xls',
+            '.xlsx',
+            '.ppt',
+            '.pptx',
+            '.odt',
+            '.ods',
+            '.odp',
+            '.bin',
+            '.dat',
+            '.obj',
+            '.o',
+            '.a',
+            '.lib',
+            '.wasm',
+            '.pyc',
+            '.pyo',
         }
 
         if not os.path.exists(filepath):
@@ -835,13 +1879,13 @@ class ActionExecutor:
                     suggestions = [
                         os.path.join(directory, entry)
                         for entry in os.listdir(directory)
-                        if basename.lower() in entry.lower() or entry.lower() in basename.lower()
+                        if basename.lower() in entry.lower()
+                        or entry.lower() in basename.lower()
                     ][:3]
                     if suggestions:
                         return ErrorObservation(
                             f'File not found: {filepath}\n\n'
-                            'Did you mean one of these?\n'
-                            + '\n'.join(suggestions)
+                            'Did you mean one of these?\n' + '\n'.join(suggestions)
                         )
                 except OSError:
                     pass
@@ -867,6 +1911,7 @@ class ActionExecutor:
                 content=output,
                 command=f'opencode_read {filepath}',
                 command_id=-1,
+                exit_code=0,
                 max_content_size=None,
             )
 
@@ -876,6 +1921,7 @@ class ActionExecutor:
                 content='Image read successfully',
                 command=f'opencode_read {filepath}',
                 command_id=-1,
+                exit_code=0,
                 max_content_size=None,
             )
         if ext == '.pdf':
@@ -883,6 +1929,7 @@ class ActionExecutor:
                 content='PDF read successfully',
                 command=f'opencode_read {filepath}',
                 command_id=-1,
+                exit_code=0,
                 max_content_size=None,
             )
         if ext in BINARY_EXTENSIONS:
@@ -896,6 +1943,7 @@ class ActionExecutor:
                         content='PDF read successfully',
                         command=f'opencode_read {filepath}',
                         command_id=-1,
+                        exit_code=0,
                         max_content_size=None,
                     )
                 is_image = (
@@ -913,12 +1961,15 @@ class ActionExecutor:
                         content='Image read successfully',
                         command=f'opencode_read {filepath}',
                         command_id=-1,
+                        exit_code=0,
                         max_content_size=None,
                     )
                 if b'\x00' in chunk:
                     return ErrorObservation(f'Cannot read binary file: {filepath}')
                 if chunk:
-                    non_printable = sum(1 for b in chunk if b < 9 or (b > 13 and b < 32))
+                    non_printable = sum(
+                        1 for b in chunk if b < 9 or (b > 13 and b < 32)
+                    )
                     if non_printable / len(chunk) > 0.3:
                         return ErrorObservation(f'Cannot read binary file: {filepath}')
         except OSError as exc:
@@ -940,6 +1991,7 @@ class ActionExecutor:
             content=output,
             command_id=-1,
             command=f'opencode_read {filepath}',
+            exit_code=0,
             max_content_size=None,
         )
 
@@ -955,7 +2007,7 @@ class ActionExecutor:
             try:
                 os.makedirs(directory, exist_ok=True)
             except OSError as e:
-                return ErrorObservation(f"Failed to create directory: {e}")
+                return ErrorObservation(f'Failed to create directory: {e}')
 
         # Preserve an existing UTF-8 BOM, matching OpenCode's Bom.join helper.
         preserve_bom = False
@@ -976,7 +2028,7 @@ class ActionExecutor:
             with open(filepath, 'w', encoding=encoding) as f:
                 f.write(output_content)
         except Exception as e:
-            return ErrorObservation(f"Failed to write file: {e}")
+            return ErrorObservation(f'Failed to write file: {e}')
 
         # This runtime does not expose OpenCode's LSP service. Raw output from
         # unrelated command-line linters is not an LSP diagnostic and must not be
@@ -987,6 +2039,13 @@ class ActionExecutor:
         """Search for files and render OpenCode's glob body."""
         assert self.bash_session is not None
         working_dir = self.bash_session.cwd
+        for value, name in (
+            (action.pattern, 'pattern'),
+            (action.path, 'path'),
+        ):
+            error = _nul_argument_error(value, name)
+            if error is not None:
+                return ErrorObservation(error)
         search_path = os.path.abspath(self._resolve_path(action.path, working_dir))
 
         if not os.path.exists(search_path):
@@ -1006,27 +2065,37 @@ class ActionExecutor:
                     '.',
                 ],
                 capture_output=True,
-                text=True,
                 timeout=30,
                 cwd=search_path,
             )
             if result.returncode == 0:
-                files = [
-                    os.path.abspath(os.path.join(search_path, item))
-                    for item in result.stdout.splitlines()
-                    if item
-                ]
+                files = []
+                for raw_item in result.stdout.splitlines():
+                    item = _decode_process_output(raw_item)
+                    if not item or '\x00' in item:
+                        continue
+                    files.append(os.path.abspath(os.path.join(search_path, item)))
             elif result.returncode == 1:
                 files = []
             else:
-                return ErrorObservation(result.stderr.strip())
+                return ErrorObservation(_decode_process_output(result.stderr).strip())
         except FileNotFoundError:
-            full_pattern = os.path.join(search_path, action.pattern)
-            files = [
-                os.path.abspath(item)
-                for item in glob_module.glob(full_pattern, recursive=True)
-                if os.path.isfile(item) and f'{os.sep}.git{os.sep}' not in item
-            ]
+            try:
+                files = _fallback_opencode_glob(
+                    Path(search_path),
+                    action.pattern,
+                    timeout_seconds=_NATIVE_SEARCH_TIMEOUT_SECONDS,
+                )
+            except _CodexGrepPreprocessingError as error:
+                return ErrorObservation(f'glob fallback failed: {error}')
+            except _NativeSearchLimitError as error:
+                return ErrorObservation(f'glob fallback failed: {error}')
+            except TimeoutError:
+                return ErrorObservation('glob fallback timed out after 30 seconds')
+            except OSError as error:
+                return ErrorObservation(
+                    f'glob fallback failed: {format_codex_os_error(error)}'
+                )
         except subprocess.TimeoutExpired:
             return ErrorObservation('glob search timed out after 30 seconds')
 
@@ -1034,6 +2103,7 @@ class ActionExecutor:
             content=format_glob(files),
             command_id=-1,
             command=f'glob {action.pattern} {action.path}',
+            exit_code=0,
             max_content_size=None,
         )
 
@@ -1041,6 +2111,14 @@ class ActionExecutor:
         """Search file contents and render OpenCode's grouped grep body."""
         assert self.bash_session is not None
         working_dir = self.bash_session.cwd
+        for value, name in (
+            (action.pattern, 'pattern'),
+            (action.include, 'include'),
+            (action.path, 'path'),
+        ):
+            error = _nul_argument_error(value, name)
+            if error is not None:
+                return ErrorObservation(error)
         search_path = os.path.abspath(self._resolve_path(action.path, working_dir))
 
         if not action.pattern:
@@ -1060,66 +2138,77 @@ class ActionExecutor:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
                 timeout=30,
                 cwd=cwd,
             )
             if result.returncode not in (0, 1):
-                return ErrorObservation(result.stderr.strip())
-            for line in result.stdout.splitlines():
+                return ErrorObservation(_decode_process_output(result.stderr).strip())
+            for raw_line in result.stdout.splitlines():
                 try:
+                    line = (
+                        raw_line.decode('utf-8')
+                        if isinstance(raw_line, bytes)
+                        else raw_line
+                    )
                     record = json.loads(line)
-                except json.JSONDecodeError:
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict):
                     continue
                 if record.get('type') != 'match':
                     continue
-                data = record['data']
-                relative_path = data['path']['text']
+                data = record.get('data')
+                if not isinstance(data, dict):
+                    continue
+                relative_path = _decode_rg_json_value(data.get('path'))
+                text = _decode_rg_json_value(data.get('lines'))
+                if (
+                    relative_path is None
+                    or text is None
+                    or '\x00' in relative_path
+                    or '\x00' in text
+                    or os.path.isabs(relative_path)
+                    or '..' in Path(relative_path).parts
+                ):
+                    continue
+                try:
+                    line_number = int(data['line_number'])
+                except (KeyError, TypeError, ValueError):
+                    continue
                 display_path = os.path.abspath(os.path.join(cwd, relative_path))
                 matches.append(
                     GrepMatch(
                         path=display_path,
-                        line=int(data['line_number']),
-                        text=data['lines']['text'],
+                        line=line_number,
+                        text=text,
                     )
                 )
                 if len(matches) == 100:
                     break
         except FileNotFoundError:
             try:
-                pattern = re.compile(action.pattern)
-            except re.error as exc:
-                return ErrorObservation(str(exc))
-            candidates: list[str] = []
-            if search_is_dir:
-                for root, dirs, filenames in os.walk(search_path):
-                    dirs[:] = [name for name in dirs if name != '.git']
-                    for filename in filenames:
-                        if action.include and not fnmatch.fnmatch(filename, action.include):
-                            continue
-                        candidates.append(os.path.join(root, filename))
-            else:
-                candidates.append(search_path)
-            for candidate in candidates:
-                try:
-                    with open(
-                        candidate,
-                        'r',
-                        encoding='utf-8',
-                        errors='replace',
-                        newline='',
-                    ) as source:
-                        for line_number, text in enumerate(source, start=1):
-                            if pattern.search(text):
-                                matches.append(
-                                    GrepMatch(candidate, line_number, text)
-                                )
-                                if len(matches) == 100:
-                                    break
-                except OSError:
-                    continue
-                if len(matches) == 100:
-                    break
+                matches = _fallback_opencode_grep(
+                    Path(search_path),
+                    action.pattern,
+                    action.include,
+                    timeout_seconds=_NATIVE_SEARCH_TIMEOUT_SECONDS,
+                )
+            except _CODEX_GREP_REGEX_ERROR as error:
+                return ErrorObservation(
+                    f'grep fallback failed: invalid regular expression: {error}'
+                )
+            except _CodexGrepPreprocessingError as error:
+                return ErrorObservation(f'grep fallback failed: {error}')
+            except _NativeSearchLimitError as error:
+                return ErrorObservation(f'grep fallback failed: {error}')
+            except _CodexGrepRegexUnavailableError as error:
+                return ErrorObservation(f'grep fallback unavailable: {error}')
+            except TimeoutError:
+                return ErrorObservation('grep fallback timed out after 30 seconds')
+            except OSError as error:
+                return ErrorObservation(
+                    f'grep fallback failed: {format_codex_os_error(error)}'
+                )
         except subprocess.TimeoutExpired:
             return ErrorObservation('grep search timed out after 30 seconds')
 
@@ -1127,6 +2216,7 @@ class ActionExecutor:
             content=format_grep(matches),
             command_id=-1,
             command=f'grep {action.pattern} {action.path}',
+            exit_code=0,
             max_content_size=None,
         )
 
@@ -1153,6 +2243,7 @@ class ActionExecutor:
             content=format_read_directory(list_path, entries),
             command_id=-1,
             command=f'list_dir {action.path}',
+            exit_code=0,
             max_content_size=None,
         )
 
@@ -1174,6 +2265,7 @@ class ActionExecutor:
         try:
             # Write the patch to a temporary file and apply with git apply
             import tempfile
+
             patch_text = action.patchText
             with tempfile.NamedTemporaryFile(
                 mode='w', suffix='.patch', delete=False
@@ -1313,11 +2405,15 @@ class ActionExecutor:
             content=output,
             command_id=-1,
             command=f'codex_read_file {path}',
+            exit_code=0,
             max_content_size=None,
         )
 
     def _codex_read_file_indentation(
-        self, lines: list[str], total_lines: int, filepath: str,
+        self,
+        lines: list[str],
+        total_lines: int,
+        filepath: str,
         action: CodexReadFileAction,
     ) -> Observation:
         """Compatibility wrapper retained for callers of the legacy helper."""
@@ -1340,15 +2436,14 @@ class ActionExecutor:
             content=output,
             command_id=-1,
             command=f'codex_read_file {filepath} (indentation mode)',
+            exit_code=0,
             max_content_size=None,
         )
 
     async def codex_list_dir(self, action: CodexListDirAction) -> Observation:
         """Execute the legacy Codex ``list_dir`` result contract."""
         if action.offset <= 0:
-            return ErrorObservation(
-                'offset must be a 1-indexed entry number'
-            )
+            return ErrorObservation('offset must be a 1-indexed entry number')
         if action.limit <= 0:
             return ErrorObservation('limit must be greater than zero')
         if action.depth <= 0:
@@ -1360,9 +2455,7 @@ class ActionExecutor:
 
         # (truncated relative sort key, component display, depth, kind)
         entries: list[tuple[str, str, int, str]] = []
-        queue: list[tuple[Path, Path, int]] = [
-            (path, Path(), action.depth)
-        ]
+        queue: list[tuple[Path, Path, int]] = [(path, Path(), action.depth)]
         queue_index = 0
 
         while queue_index < len(queue):
@@ -1373,13 +2466,10 @@ class ActionExecutor:
                     current_entries = list(iterator)
             except OSError as error:
                 return ErrorObservation(
-                    f'failed to read directory: '
-                    f'{format_codex_os_error(error)}'
+                    f'failed to read directory: {format_codex_os_error(error)}'
                 )
 
-            collected: list[
-                tuple[Path, Path, str, str, int, str]
-            ] = []
+            collected: list[tuple[Path, Path, str, str, int, str]] = []
             for entry in current_entries:
                 try:
                     if entry.is_symlink():
@@ -1392,20 +2482,19 @@ class ActionExecutor:
                         kind = 'other'
                 except OSError as error:
                     return ErrorObservation(
-                        f'failed to inspect entry: '
-                        f'{format_codex_os_error(error)}'
+                        f'failed to inspect entry: {format_codex_os_error(error)}'
                     )
 
                 relative_path = prefix / entry.name
                 display_name = take_codex_utf8_prefix(
-                    os.fsencode(entry.name).decode(
-                        'utf-8', errors='replace'
-                    ),
+                    os.fsencode(entry.name).decode('utf-8', errors='replace'),
                     500,
                 )
-                normalized_path = os.fsencode(relative_path).decode(
-                    'utf-8', errors='replace'
-                ).replace('\\', '/')
+                normalized_path = (
+                    os.fsencode(relative_path)
+                    .decode('utf-8', errors='replace')
+                    .replace('\\', '/')
+                )
                 sort_key = take_codex_utf8_prefix(normalized_path, 500)
                 display_depth = len(prefix.parts)
                 collected.append(
@@ -1429,12 +2518,8 @@ class ActionExecutor:
                 kind,
             ) in collected:
                 if kind == 'directory' and remaining_depth > 1:
-                    queue.append(
-                        (entry_path, relative_path, remaining_depth - 1)
-                    )
-                entries.append(
-                    (sort_key, display_name, display_depth, kind)
-                )
+                    queue.append((entry_path, relative_path, remaining_depth - 1))
+                entries.append((sort_key, display_name, display_depth, kind))
 
         entries.sort(key=lambda item: item[0])
         absolute_display = os.fsencode(path).decode('utf-8', errors='replace')
@@ -1442,9 +2527,7 @@ class ActionExecutor:
         if entries:
             start_index = action.offset - 1
             if start_index >= len(entries):
-                return ErrorObservation(
-                    'offset exceeds directory entry count'
-                )
+                return ErrorObservation('offset exceeds directory entry count')
             capped_limit = min(action.limit, len(entries) - start_index)
             end_index = start_index + capped_limit
             suffixes = {
@@ -1453,17 +2536,12 @@ class ActionExecutor:
                 'other': '?',
                 'file': '',
             }
-            for _, display_name, display_depth, kind in entries[
-                start_index:end_index
-            ]:
+            for _, display_name, display_depth, kind in entries[start_index:end_index]:
                 output_lines.append(
-                    f'{"  " * display_depth}{display_name}'
-                    f'{suffixes[kind]}'
+                    f'{"  " * display_depth}{display_name}{suffixes[kind]}'
                 )
             if end_index < len(entries):
-                output_lines.append(
-                    f'More than {capped_limit} entries found'
-                )
+                output_lines.append(f'More than {capped_limit} entries found')
 
         output = truncate_codex_function_output(
             '\n'.join(output_lines),
@@ -1473,6 +2551,7 @@ class ActionExecutor:
             content=output,
             command_id=-1,
             command=f'codex_list_dir {path}',
+            exit_code=0,
             max_content_size=None,
         )
 
@@ -1483,16 +2562,24 @@ class ActionExecutor:
         pattern = action.pattern.strip()
         if not pattern:
             return ErrorObservation('pattern must not be empty')
+        error = _nul_argument_error(pattern, 'pattern')
+        if error is not None:
+            return ErrorObservation(error)
         if action.limit <= 0:
             return ErrorObservation('limit must be greater than zero')
 
         limit = min(action.limit, 2000)
         search_path = Path(
-            self._resolve_path(action.path, working_dir)
-            if action.path
-            else working_dir
+            self._resolve_path(action.path, working_dir) if action.path else working_dir
         )
         include = (action.include or '').strip() or None
+        if include is not None:
+            error = _nul_argument_error(include, 'include')
+            if error is not None:
+                return ErrorObservation(error)
+        error = _nul_argument_error(search_path, 'path')
+        if error is not None:
+            return ErrorObservation(error)
         try:
             search_path.stat()
         except OSError as error:
@@ -1514,6 +2601,7 @@ class ActionExecutor:
         ]
         if include:
             command.extend(('--glob', include))
+        command.extend(('--glob', '!**/.git/**'))
         command.extend(('--', str(search_path)))
 
         try:
@@ -1525,30 +2613,56 @@ class ActionExecutor:
             )
         except subprocess.TimeoutExpired:
             return ErrorObservation('rg timed out after 30 seconds')
+        except FileNotFoundError:
+            try:
+                files = _fallback_codex_grep_files(
+                    search_path,
+                    pattern,
+                    include,
+                    limit,
+                )
+            except _CODEX_GREP_REGEX_ERROR as error:
+                return ErrorObservation(
+                    f'grep_files fallback failed: invalid regular expression: {error}'
+                )
+            except _CodexGrepPreprocessingError as error:
+                return ErrorObservation(f'grep_files fallback failed: {error}')
+            except _NativeSearchLimitError as error:
+                return ErrorObservation(f'grep_files fallback failed: {error}')
+            except _CodexGrepRegexUnavailableError as error:
+                return ErrorObservation(f'grep_files fallback unavailable: {error}')
+            except TimeoutError:
+                return ErrorObservation(
+                    'grep_files fallback timed out after 30 seconds'
+                )
+            except OSError as error:
+                return ErrorObservation(
+                    f'grep_files fallback failed: {format_codex_os_error(error)}'
+                )
         except OSError as error:
             return ErrorObservation(
                 f'failed to launch rg: {format_codex_os_error(error)}. '
                 'Ensure ripgrep is installed and on PATH.'
             )
-
-        if result.returncode == 0:
-            files = []
-            for raw_line in result.stdout.split(b'\n'):
-                if not raw_line:
-                    continue
-                try:
-                    file_path = raw_line.decode('utf-8')
-                except UnicodeDecodeError:
-                    continue
-                if file_path:
-                    files.append(file_path)
-                    if len(files) == limit:
-                        break
-        elif result.returncode == 1:
-            files = []
         else:
-            stderr = result.stderr.decode('utf-8', errors='replace')
-            return ErrorObservation(f'rg failed: {stderr}')
+            if result.returncode == 0:
+                files = []
+                for raw_line in result.stdout.split(b'\n'):
+                    if not raw_line:
+                        continue
+                    try:
+                        file_path = raw_line.decode('utf-8')
+                    except UnicodeDecodeError:
+                        continue
+                    if file_path:
+                        files.append(file_path)
+                        if len(files) == limit:
+                            break
+            elif result.returncode == 1:
+                files = []
+            else:
+                stderr = result.stderr.decode('utf-8', errors='replace')
+                return ErrorObservation(f'rg failed: {stderr}')
 
         output = '\n'.join(files) if files else 'No matches found.'
         output = truncate_codex_function_output(
@@ -1559,6 +2673,7 @@ class ActionExecutor:
             content=output,
             command_id=-1,
             command=f'codex_grep_files {pattern}',
+            exit_code=0,
             max_content_size=None,
         )
 
@@ -1620,28 +2735,20 @@ class ActionExecutor:
 
                 elif hunk_type == 'delete':
                     if not os.path.exists(full_path):
-                        errors.append(
-                            f"Delete failed: file not found '{path}'"
-                        )
+                        errors.append(f"Delete failed: file not found '{path}'")
                         continue
                     os.unlink(full_path)
                     deleted.append(path)
 
                 elif hunk_type == 'update':
                     if not os.path.exists(full_path):
-                        errors.append(
-                            f"Update failed: file not found '{path}'"
-                        )
+                        errors.append(f"Update failed: file not found '{path}'")
                         continue
                     if not os.path.isfile(full_path):
-                        errors.append(
-                            f"Update failed: '{path}' is not a regular file"
-                        )
+                        errors.append(f"Update failed: '{path}' is not a regular file")
                         continue
 
-                    err = self._codex_apply_update_hunk(
-                        full_path, hunk['chunks']
-                    )
+                    err = self._codex_apply_update_hunk(full_path, hunk['chunks'])
                     if err:
                         errors.append(f"Update failed for '{path}': {err}")
                         continue
@@ -1674,9 +2781,7 @@ class ActionExecutor:
                     summary_parts.append(f'  M {p}')
                 for p in deleted:
                     summary_parts.append(f'  D {p}')
-            summary_parts.append(
-                f'Errors ({len(errors)}):'
-            )
+            summary_parts.append(f'Errors ({len(errors)}):')
             for err in errors:
                 summary_parts.append(f'  - {err}')
             return CodexApplyPatchObservation(
@@ -1726,7 +2831,7 @@ class ActionExecutor:
             raise ValueError('Patch text is empty')
 
         # Strip heredoc wrapper if present (lenient mode, like gpt-4.1)
-        if lines[0].strip() in ("<<EOF", "<<'EOF'", '<<"EOF"'):
+        if lines[0].strip() in ('<<EOF', "<<'EOF'", '<<"EOF"'):
             if len(lines) >= 4 and lines[-1].strip().endswith('EOF'):
                 lines = lines[1:-1]
 
@@ -1754,11 +2859,9 @@ class ActionExecutor:
                 continue
 
             if line.startswith('*** Add File: '):
-                path = line[len('*** Add File: '):]
+                path = line[len('*** Add File: ') :]
                 if not path:
-                    raise ValueError(
-                        f"Empty path in '*** Add File:' on line {i + 2}"
-                    )
+                    raise ValueError(f"Empty path in '*** Add File:' on line {i + 2}")
                 contents = ''
                 i += 1
                 while i < len(content_lines):
@@ -1767,14 +2870,16 @@ class ActionExecutor:
                         i += 1
                     else:
                         break
-                hunks.append({
-                    'type': 'add',
-                    'path': path,
-                    'contents': contents,
-                })
+                hunks.append(
+                    {
+                        'type': 'add',
+                        'path': path,
+                        'contents': contents,
+                    }
+                )
 
             elif line.startswith('*** Delete File: '):
-                path = line[len('*** Delete File: '):]
+                path = line[len('*** Delete File: ') :]
                 if not path:
                     raise ValueError(
                         f"Empty path in '*** Delete File:' on line {i + 2}"
@@ -1783,7 +2888,7 @@ class ActionExecutor:
                 i += 1
 
             elif line.startswith('*** Update File: '):
-                path = line[len('*** Update File: '):]
+                path = line[len('*** Update File: ') :]
                 if not path:
                     raise ValueError(
                         f"Empty path in '*** Update File:' on line {i + 2}"
@@ -1792,8 +2897,10 @@ class ActionExecutor:
 
                 # Optional: *** Move to: <path>
                 move_path = None
-                if i < len(content_lines) and content_lines[i].strip().startswith('*** Move to: '):
-                    move_path = content_lines[i].strip()[len('*** Move to: '):]
+                if i < len(content_lines) and content_lines[i].strip().startswith(
+                    '*** Move to: '
+                ):
+                    move_path = content_lines[i].strip()[len('*** Move to: ') :]
                     i += 1
 
                 # Parse chunks within this Update File hunk
@@ -1823,12 +2930,14 @@ class ActionExecutor:
                         f"Update File hunk for '{path}' contains no change chunks"
                     )
 
-                hunks.append({
-                    'type': 'update',
-                    'path': path,
-                    'move_path': move_path,
-                    'chunks': chunks,
-                })
+                hunks.append(
+                    {
+                        'type': 'update',
+                        'path': path,
+                        'move_path': move_path,
+                        'chunks': chunks,
+                    }
+                )
 
             else:
                 raise ValueError(
@@ -1876,9 +2985,7 @@ class ActionExecutor:
             # *** End of File marker
             if raw.strip() == '*** End of File':
                 if parsed == 0:
-                    raise ValueError(
-                        f"Empty update chunk at line {idx + 2}"
-                    )
+                    raise ValueError(f'Empty update chunk at line {idx + 2}')
                 is_eof = True
                 idx += 1
                 parsed += 1
@@ -1944,30 +3051,23 @@ class ActionExecutor:
             return None
 
         search_start = (
-            len(lines) - len(pattern) if eof and len(lines) >= len(pattern)
-            else start
+            len(lines) - len(pattern) if eof and len(lines) >= len(pattern) else start
         )
         end = len(lines) - len(pattern)
 
         # Exact match
         for i in range(search_start, end + 1):
-            if lines[i:i + len(pattern)] == pattern:
+            if lines[i : i + len(pattern)] == pattern:
                 return i
 
         # rstrip match
         for i in range(search_start, end + 1):
-            if all(
-                lines[i + j].rstrip() == p.rstrip()
-                for j, p in enumerate(pattern)
-            ):
+            if all(lines[i + j].rstrip() == p.rstrip() for j, p in enumerate(pattern)):
                 return i
 
         # trim match (strip both sides)
         for i in range(search_start, end + 1):
-            if all(
-                lines[i + j].strip() == p.strip()
-                for j, p in enumerate(pattern)
-            ):
+            if all(lines[i + j].strip() == p.strip() for j, p in enumerate(pattern)):
                 return i
 
         # Unicode-normalized match
@@ -1980,7 +3080,10 @@ class ActionExecutor:
                     result.append("'")
                 elif c in '\u201c\u201d\u201e\u201f':
                     result.append('"')
-                elif c in '\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000':
+                elif (
+                    c
+                    in '\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000'
+                ):
                     result.append(' ')
                 else:
                     result.append(c)
@@ -1988,8 +3091,7 @@ class ActionExecutor:
 
         for i in range(search_start, end + 1):
             if all(
-                _normalize(lines[i + j]) == _normalize(p)
-                for j, p in enumerate(pattern)
+                _normalize(lines[i + j]) == _normalize(p) for j, p in enumerate(pattern)
             ):
                 return i
 
@@ -2028,9 +3130,9 @@ class ActionExecutor:
                 )
                 if ctx_idx is None:
                     return (
-                        f"Chunk {chunk_idx + 1}: could not find context "
+                        f'Chunk {chunk_idx + 1}: could not find context '
                         f"line '{context}' in file "
-                        f"(searched from line {line_index + 1})"
+                        f'(searched from line {line_index + 1})'
                     )
                 line_index = ctx_idx + 1
 
@@ -2068,9 +3170,9 @@ class ActionExecutor:
                     preview.append(f'... ({len(old_lines) - 5} more lines)')
                 preview_str = '\n'.join(f'  {l}' for l in preview)
                 return (
-                    f"Chunk {chunk_idx + 1}: could not find the expected "
-                    f"lines in file (searched from line {line_index + 1}).\n"
-                    f"Looking for:\n{preview_str}"
+                    f'Chunk {chunk_idx + 1}: could not find the expected '
+                    f'lines in file (searched from line {line_index + 1}).\n'
+                    f'Looking for:\n{preview_str}'
                 )
 
             replacements.append((found, len(pattern), list(new_slice)))
@@ -2081,7 +3183,7 @@ class ActionExecutor:
 
         # Apply replacements in reverse order so indices stay valid
         for start_idx, old_len, new_segment in reversed(replacements):
-            del original_lines[start_idx:start_idx + old_len]
+            del original_lines[start_idx : start_idx + old_len]
             for offset, new_line in enumerate(new_segment):
                 original_lines.insert(start_idx + offset, new_line)
 
@@ -2108,9 +3210,13 @@ class ActionExecutor:
             in_progress_count = 0
             for item in plan_items:
                 if not isinstance(item, dict):
-                    return ErrorObservation('Each plan item must be a dict with step and status')
+                    return ErrorObservation(
+                        'Each plan item must be a dict with step and status'
+                    )
                 if 'step' not in item or 'status' not in item:
-                    return ErrorObservation('Each plan item must have step and status fields')
+                    return ErrorObservation(
+                        'Each plan item must have step and status fields'
+                    )
                 if item['status'] not in ('pending', 'in_progress', 'completed'):
                     return ErrorObservation(
                         f"Invalid status '{item['status']}'. Must be: pending, in_progress, completed"
@@ -2203,7 +3309,9 @@ class ActionExecutor:
                 cmd_action = CmdRunAction(command=special_key, is_input=True)
                 cmd_action.set_hard_timeout(duration + 5, blocking=False)
                 obs = await call_sync_from_async(bash_session.execute, cmd_action)
-                screen = self._format_terminal_screen(obs, f'^{"C" if special_key == "C-c" else "D"}', pre_cwd)
+                screen = self._format_terminal_screen(
+                    obs, f'^{"C" if special_key == "C-c" else "D"}', pre_cwd
+                )
                 terminal_state = f'New Terminal Output:\n{screen}'
                 return Terminus2CmdOutputObservation(
                     content=terminal_state,

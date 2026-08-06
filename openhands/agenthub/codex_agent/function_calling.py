@@ -1,6 +1,8 @@
 """Function calling implementation for Codex agent."""
 
 import json
+import math
+import os
 
 from litellm import ModelResponse
 
@@ -79,6 +81,10 @@ def response_to_actions(
                     raise FunctionCallValidationError(
                         f'Failed to parse tool call arguments: {tool_call.function.arguments}'
                     ) from e
+                if not isinstance(arguments, dict):
+                    raise FunctionCallValidationError(
+                        'Tool call arguments must be a JSON object'
+                    )
 
                 # ================================================
                 # Shell Command
@@ -88,20 +94,75 @@ def response_to_actions(
                         raise FunctionCallValidationError(
                             f'Missing required argument "command" in tool call {tool_call.function.name}'
                         )
+                    command_arg = arguments['command']
+                    if not isinstance(command_arg, str) or '\0' in command_arg:
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'command' argument: {command_arg!r}"
+                        )
 
-                    is_input = arguments.get('is_input', 'false') == 'true'
+                    is_input_arg = arguments.get('is_input', 'false')
+                    if not isinstance(is_input_arg, str) or is_input_arg not in {
+                        'true',
+                        'false',
+                    }:
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'is_input' argument: {is_input_arg!r}"
+                        )
+
+                    workdir = arguments.get('workdir')
+                    if workdir is not None and (
+                        not isinstance(workdir, str)
+                        or not workdir.strip()
+                        or '\0' in workdir
+                        or not os.path.isabs(workdir)
+                    ):
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'workdir' argument: {workdir!r}"
+                        )
+
+                    login = arguments.get('login')
+                    if login is not None and not isinstance(login, bool):
+                        raise FunctionCallValidationError(
+                            f"Invalid value passed to 'login' argument: {login!r}"
+                        )
+                    if is_input_arg == 'true' and (
+                        'workdir' in arguments or 'login' in arguments
+                    ):
+                        raise FunctionCallValidationError(
+                            "'workdir' and 'login' cannot be used when 'is_input' is true"
+                        )
+
                     action = CmdRunAction(
-                        command=arguments['command'],
-                        is_input=is_input,
+                        command=command_arg,
+                        is_input=is_input_arg == 'true',
+                        cwd=workdir,
+                        login=login,
                     )
                     if 'timeout_ms' in arguments:
-                        try:
-                            timeout_s = min(float(arguments['timeout_ms']) / 1000.0, 600)
-                            action.set_hard_timeout(timeout_s)
-                        except ValueError as e:
+                        timeout_ms = arguments['timeout_ms']
+                        timeout_is_invalid = (
+                            isinstance(timeout_ms, bool)
+                            or not isinstance(timeout_ms, (int, float))
+                            or timeout_ms <= 0
+                            or (
+                                isinstance(timeout_ms, float)
+                                and not math.isfinite(timeout_ms)
+                            )
+                        )
+                        if timeout_is_invalid:
                             raise FunctionCallValidationError(
-                                f"Invalid value passed to 'timeout_ms' argument: {arguments['timeout_ms']}"
-                            ) from e
+                                f"Invalid value passed to 'timeout_ms' argument: {timeout_ms!r}"
+                            )
+                        timeout_s = (
+                            600
+                            if timeout_ms >= 600_000
+                            else timeout_ms / 1000.0
+                        )
+                        if timeout_s <= 0:
+                            raise FunctionCallValidationError(
+                                f"Invalid value passed to 'timeout_ms' argument: {timeout_ms!r}"
+                            )
+                        action.set_hard_timeout(timeout_s)
                     set_security_risk(action, arguments)
 
                 # ================================================

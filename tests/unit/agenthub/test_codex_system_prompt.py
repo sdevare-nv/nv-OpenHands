@@ -9,8 +9,8 @@ from openhands.agenthub.codex_agent.codex_agent import CodexAgent
 from openhands.core.config import AgentConfig
 
 
-UPSTREAM_DEFAULT_PROMPT_SHA256 = (
-    "294602e3502bb0ff840a82cd1d08ac526125a6cdf763e1f883e8d74f47cc2a8d"
+DEFAULT_PROMPT_SHA256 = (
+    "a6901b549c226871dfb856799d0e207a0d14bd95c64cbcac3f7e2d653bd11ed3"
 )
 PROMPT_DIR = Path(codex_agent_module.__file__).with_name("prompts")
 PROMPT_PATH = PROMPT_DIR / "system_prompt.j2"
@@ -24,10 +24,21 @@ def make_agent(config: AgentConfig, model: str = "unknown") -> CodexAgent:
     return agent
 
 
-def test_system_prompt_is_pinned_upstream_default_with_clean_whitespace() -> None:
+def test_system_prompt_is_pinned_default_with_clean_whitespace() -> None:
     assert hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest() == (
-        UPSTREAM_DEFAULT_PROMPT_SHA256
+        DEFAULT_PROMPT_SHA256
     )
+
+
+def test_default_prompt_describes_the_apply_patch_tool_contract() -> None:
+    prompt = PROMPT_PATH.read_text()
+
+    assert 'Pass the complete patch as its `input` string' in prompt
+    assert '{"input":"*** Begin Patch\\\\n' in prompt
+    assert '"command":["apply_patch"' not in prompt
+    assert 'subagent' not in prompt.lower()
+    assert 'sub-agent' not in prompt.lower()
+    assert 'delegate' not in prompt.lower()
 
 
 @pytest.mark.parametrize(

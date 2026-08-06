@@ -15,7 +15,7 @@ _DETAILED_BASH_DESCRIPTION = """Execute a bash command in the terminal within a 
 * One command at a time: You can only execute one bash command at a time. If you need to run multiple commands sequentially, use `&&` or `;` to chain them together.
 * Persistent session: Commands execute in a persistent shell session where environment variables, virtual environments, and working directory persist between commands.
 * Soft timeout: Commands have a soft timeout of 10 seconds, once that's reached, you have the option to continue or interrupt the command (see section below for details)
-* Shell options: Do NOT use `set -e`, `set -eu`, or `set -euo pipefail` in shell scripts or commands in this environment. The runtime may not support them and can cause unusable shell sessions. If you want to run multi-line bash commands, write the commands to a file and then run it, instead.
+* Shell options: Do NOT persistently enable `set -e` or `set -u`; they can make the shared shell session unusable. When piping a test, lint, typecheck, or build command through `head`, `tail`, or `grep`, preserve the upstream exit status in a subshell, for example `(set -o pipefail; pytest -q 2>&1 | tail -n 50)`. If you want to run multi-line bash commands, write the commands to a file and then run it, instead.
 
 ### Long-running Commands
 * For commands that may run indefinitely, run them in the background and redirect output to a file, e.g. `python3 app.py > server.log 2>&1 &`.
@@ -37,7 +37,8 @@ _DETAILED_BASH_DESCRIPTION = """Execute a bash command in the terminal within a 
 _SHORT_BASH_DESCRIPTION = """Execute a bash command in the terminal.
 * Long running commands: For commands that may run indefinitely, it should be run in the background and the output should be redirected to a file, e.g. command = `python3 app.py > server.log 2>&1 &`. For commands that need to run for a specific duration, you can set the "timeout" argument to specify a hard timeout in seconds.
 * Interact with running process: If a bash command returns exit code `-1`, this means the process is not yet finished. By setting `is_input` to `true`, the assistant can interact with the running process and send empty `command` to retrieve any additional logs, or send additional text (set `command` to the text) to STDIN of the running process, or send command like `C-c` (Ctrl+C), `C-d` (Ctrl+D), `C-z` (Ctrl+Z) to interrupt the process.
-* One command at a time: You can only execute one bash command at a time. If you need to run multiple commands sequentially, you can use `&&` or `;` to chain them together."""
+* One command at a time: You can only execute one bash command at a time. If you need to run multiple commands sequentially, you can use `&&` or `;` to chain them together.
+* Validation pipelines: When piping test, lint, typecheck, or build output through `head`, `tail`, or `grep`, preserve the upstream exit status, for example `(set -o pipefail; pytest -q 2>&1 | tail -n 50)`."""
 
 
 def create_cmd_run_tool(

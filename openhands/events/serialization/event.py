@@ -151,6 +151,14 @@ def event_to_dict(event: 'Event') -> dict:
     # byte-for-byte stable while still serializing the non-default behavior.
     if d.get('action') == 'edit' and props.get('replace_all') is False:
         props.pop('replace_all')
+    # These optional CmdRunAction fields were added after older trajectories
+    # were written. Omit their inert defaults so legacy events round-trip
+    # without gaining new keys, while preserving explicit behavior.
+    if d.get('action') == 'run':
+        if props.get('login') is None:
+            props.pop('login', None)
+        if props.get('bypass_blacklist') is False:
+            props.pop('bypass_blacklist', None)
     if 'action' in d:
         # Handle security_risk for actions - include it in args
         if 'security_risk' in props:

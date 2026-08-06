@@ -9,8 +9,8 @@ from openhands.agenthub.opencode_agent.opencode_agent import OpenCodeAgent
 from openhands.core.config import AgentConfig
 
 
-UPSTREAM_DEFAULT_PROMPT_SHA256 = (
-    "962fbf3cb3ec659c9a5244425ee2e7bb141ad4428f489a630a7738566880dc6a"
+DEFAULT_PROMPT_SHA256 = (
+    "87e9bb0b536255e99fe2645480d7dc05fa8d0968d4a7998e9e40f42b373cd12f"
 )
 PROMPT_DIR = Path(opencode_agent_module.__file__).with_name("prompts")
 PROMPT_PATH = PROMPT_DIR / "system_prompt.j2"
@@ -24,10 +24,23 @@ def make_agent(config: AgentConfig, model: str = "unknown") -> OpenCodeAgent:
     return agent
 
 
-def test_system_prompt_is_exact_pinned_upstream_default() -> None:
+def test_system_prompt_is_pinned_default() -> None:
     assert hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest() == (
-        UPSTREAM_DEFAULT_PROMPT_SHA256
+        DEFAULT_PROMPT_SHA256
     )
+
+
+def test_default_prompt_only_recommends_available_search_tools() -> None:
+    prompt = PROMPT_PATH.read_text()
+    normalized_prompt = prompt.lower()
+
+    assert 'task tool' not in normalized_prompt
+    assert 'webfetch tool' not in normalized_prompt
+    assert 'subagent' not in normalized_prompt
+    assert 'sub-agent' not in normalized_prompt
+    assert 'delegate' not in normalized_prompt
+    assert 'use the glob and grep tools' in prompt
+    assert 'with the bash tool' in prompt
 
 
 @pytest.mark.parametrize(

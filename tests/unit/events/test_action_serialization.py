@@ -133,6 +133,41 @@ def test_cmd_run_action_serialization_deserialization():
     serialization_deserialization(original_action_dict, CmdRunAction)
 
 
+def test_cmd_run_action_shell_options_serialization_deserialization():
+    action = CmdRunAction(
+        command='pwd',
+        cwd='/workspace/path with spaces',
+        login=False,
+    )
+
+    serialized = event_to_dict(action)
+    assert serialized['args']['cwd'] == '/workspace/path with spaces'
+    assert serialized['args']['login'] is False
+
+    restored = event_from_dict(serialized)
+    assert isinstance(restored, CmdRunAction)
+    assert restored.cwd == '/workspace/path with spaces'
+    assert restored.login is False
+
+
+def test_cmd_run_action_legacy_payload_defaults_to_existing_shell():
+    legacy = {
+        'action': 'run',
+        'args': {
+            'command': 'pwd',
+            'is_input': False,
+        },
+    }
+
+    restored = event_from_dict(legacy)
+
+    assert isinstance(restored, CmdRunAction)
+    assert restored.login is None
+    serialized_args = event_to_dict(restored)['args']
+    assert 'login' not in serialized_args
+    assert 'bypass_blacklist' not in serialized_args
+
+
 def test_browse_url_action_serialization_deserialization():
     original_action_dict = {
         'action': 'browse',

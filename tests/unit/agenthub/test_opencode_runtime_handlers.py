@@ -5,6 +5,7 @@ using real file operations on temporary directories, without requiring Docker.
 """
 
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -120,6 +121,8 @@ class TestOpenCodeReadHandler:
         action = OpenCodeReadAction(path=filepath)
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, CmdOutputObservation)
+        assert obs.success is True
+        assert obs.exit_code == 0
         assert obs.content == (
             f'<path>{filepath}</path>\n'
             '<type>file</type>\n'
@@ -238,6 +241,29 @@ class TestOpenCodeReadHandler:
 
         assert isinstance(obs, CmdOutputObservation)
         assert obs.content == expected
+        assert obs.success is True
+        assert obs.exit_code == 0
+
+    @pytest.mark.parametrize(
+        ('extension', 'expected'),
+        [
+            ('.png', 'Image read successfully'),
+            ('.pdf', 'PDF read successfully'),
+        ],
+    )
+    def test_read_media_extensions_have_success_metadata(
+        self, executor, temp_workspace, extension, expected
+    ):
+        filepath = create_test_file(
+            temp_workspace, f'attachment{extension}', 'placeholder'
+        )
+
+        obs = run(executor.opencode_read(OpenCodeReadAction(path=filepath)))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == expected
+        assert obs.success is True
+        assert obs.exit_code == 0
 
     def test_read_directory_returns_immediate_entries(self, executor, temp_workspace):
         """Read accepts directories and returns only their immediate entries."""
@@ -249,6 +275,8 @@ class TestOpenCodeReadHandler:
         action = OpenCodeReadAction(path=subdir)
         obs = run(executor.opencode_read(action))
         assert isinstance(obs, CmdOutputObservation)
+        assert obs.success is True
+        assert obs.exit_code == 0
         assert obs.content == (
             f'<path>{subdir}</path>\n'
             '<type>directory</type>\n'
@@ -575,6 +603,8 @@ class TestGlobHandler:
         assert isinstance(obs, CmdOutputObservation)
         assert 'main.py' in obs.content
         assert 'utils.py' in obs.content
+        assert obs.success is True
+        assert obs.exit_code == 0
 
     def test_glob_finds_json_files(self, executor, temp_workspace):
         """Glob returns absolute paths without an extra envelope."""
@@ -625,6 +655,29 @@ class TestGlobHandler:
             'Consider using a more specific path or pattern.)'
         )
 
+    def test_glob_decodes_invalid_utf8_filename_output_lossily(
+        self, executor, temp_workspace
+    ):
+        rg_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b'normal.py\ninvalid-\xff.py\nunsafe\x00.py\n',
+            stderr=b'',
+        )
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=rg_result,
+        ):
+            obs = run(executor.glob(GlobAction(pattern='*.py', path=temp_workspace)))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content.splitlines() == [
+            os.path.join(temp_workspace, 'normal.py'),
+            os.path.join(temp_workspace, 'invalid-�.py'),
+        ]
+        assert obs.success is True
+        assert obs.exit_code == 0
+
     def test_glob_nonexistent_path(self, executor, temp_workspace):
         """Test glob on nonexistent path returns error."""
         action = GlobAction(
@@ -659,6 +712,233 @@ class TestGlobHandler:
         obs = run(executor.glob(action))
         assert isinstance(obs, CmdOutputObservation)
         assert 'a.py' in obs.content
+
+    def test_missing_rg_fallback_supports_braces_paths_and_git_exclusion(
+        self, executor, temp_workspace
+    ):
+        expected = {
+            create_test_file(temp_workspace, 'src/root.py', ''),
+            create_test_file(temp_workspace, 'src/deep/code.pyi', ''),
+            create_test_file(temp_workspace, 'src/.hidden.py', ''),
+            create_test_file(temp_workspace, 'tests/test_code.py', ''),
+        }
+        create_test_file(temp_workspace, '.gitignore', 'vendor/\n')
+        create_test_file(temp_workspace, '.ignore', 'ignored*.py\n')
+        create_test_file(temp_workspace, '.rgignore', 'generated/\n')
+        create_test_file(temp_workspace, 'src/deep/code.txt', '')
+        create_test_file(temp_workspace, 'src/vendor/pkg/dependency.py', '')
+        # The positive rg glob explicitly selects this file and therefore
+        # overrides the matching .ignore rule.
+        expected.add(create_test_file(temp_workspace, 'src/deep/ignored-output.py', ''))
+        create_test_file(temp_workspace, 'src/generated/output.py', '')
+        create_test_file(temp_workspace, '.git/hidden.py', '')
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            obs = run(
+                executor.glob(
+                    GlobAction(
+                        pattern='{src,tests}/**/*.{py,pyi}',
+                        path=temp_workspace,
+                    )
+                )
+            )
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert set(obs.content.splitlines()) == expected
+        assert '.git' not in obs.content
+        assert 'vendor' not in obs.content
+        assert 'ignored-output.py' in obs.content
+        assert 'generated' not in obs.content
+        assert obs.success is True
+        assert obs.exit_code == 0
+
+    def test_missing_rg_negative_glob_honors_nested_ignore_rules(
+        self, executor, temp_workspace
+    ):
+        expected = {
+            create_test_file(temp_workspace, 'root.txt', ''),
+            create_test_file(temp_workspace, 'nested/keep.txt', ''),
+            create_test_file(temp_workspace, 'nested/deep/anchored.txt', ''),
+        }
+        create_test_file(
+            temp_workspace,
+            'nested/.gitignore',
+            '/anchored.txt\nignored/\n*.txt\n!keep.txt\n!deep/anchored.txt\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/.ignore',
+            'ignored-by-ignore.txt\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/.rgignore',
+            'ignored-by-rgignore.txt\n',
+        )
+        create_test_file(temp_workspace, 'nested/anchored.txt', '')
+        create_test_file(temp_workspace, 'nested/drop.txt', '')
+        create_test_file(temp_workspace, 'nested/ignored/secret.txt', '')
+        create_test_file(temp_workspace, 'nested/ignored-by-ignore.txt', '')
+        create_test_file(temp_workspace, 'nested/ignored-by-rgignore.txt', '')
+
+        # A positive rg glob overrides ignore files. Use a negative-only glob
+        # to verify the fallback's ordinary nested-ignore behavior.
+        action = GlobAction(pattern='!*.bin', path=temp_workspace)
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            fallback = run(executor.glob(action))
+
+        assert isinstance(fallback, CmdOutputObservation)
+        assert set(fallback.content.splitlines()) == expected
+        assert fallback.success is True
+        assert fallback.exit_code == 0
+
+    @pytest.mark.parametrize(
+        ('pattern', 'expected_relative_paths'),
+        [
+            ('*.py', ('.root.py', 'visible.py')),
+            ('*', ('.root.py', 'visible.py', '.hidden/deep/a.py')),
+            ('**/*', ('.root.py', 'visible.py', '.hidden/deep/a.py')),
+        ],
+    )
+    def test_missing_rg_matches_real_rg_hidden_directory_glob_rules(
+        self,
+        executor,
+        temp_workspace,
+        pattern,
+        expected_relative_paths,
+    ):
+        import shutil
+
+        if shutil.which('rg') is None:
+            pytest.skip('ripgrep is required for the parity half of this test')
+
+        for relative_path in ('.root.py', 'visible.py', '.hidden/deep/a.py'):
+            create_test_file(temp_workspace, relative_path, '')
+        expected = {
+            os.path.join(temp_workspace, relative_path)
+            for relative_path in expected_relative_paths
+        }
+
+        action = GlobAction(pattern=pattern, path=temp_workspace)
+        primary = run(executor.glob(action))
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            fallback = run(executor.glob(action))
+
+        assert isinstance(primary, CmdOutputObservation)
+        assert isinstance(fallback, CmdOutputObservation)
+        assert set(primary.content.splitlines()) == expected
+        assert set(fallback.content.splitlines()) == expected
+
+    @pytest.mark.parametrize(
+        ('pattern', 'expected_names'),
+        [
+            ('*.txt', {'keep.txt', 'ignored.txt'}),
+            (
+                '*',
+                {
+                    '.gitignore',
+                    'keep.txt',
+                    'ignored.txt',
+                    'ignored-dir/nested.txt',
+                },
+            ),
+        ],
+    )
+    def test_missing_rg_glob_matches_real_rg_positive_glob_ignore_override(
+        self,
+        executor,
+        temp_workspace,
+        pattern,
+        expected_names,
+    ):
+        import shutil
+
+        if shutil.which('rg') is None:
+            pytest.skip('ripgrep is required for the parity half of this test')
+
+        create_test_file(
+            temp_workspace,
+            '.gitignore',
+            'ignored.txt\nignored-dir/\n',
+        )
+        for name in ('keep.txt', 'ignored.txt', 'ignored-dir/nested.txt'):
+            create_test_file(temp_workspace, name, '')
+
+        action = GlobAction(pattern=pattern, path=temp_workspace)
+        primary = run(executor.glob(action))
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            fallback = run(executor.glob(action))
+
+        expected = {os.path.join(temp_workspace, name) for name in expected_names}
+        assert isinstance(primary, CmdOutputObservation)
+        assert isinstance(fallback, CmdOutputObservation)
+        assert set(primary.content.splitlines()) == expected
+        assert set(fallback.content.splitlines()) == expected
+
+    @pytest.mark.parametrize(
+        ('field', 'expected'),
+        [
+            ('pattern', 'pattern must not contain NUL bytes'),
+            ('path', 'path must not contain NUL bytes'),
+        ],
+    )
+    def test_glob_rejects_nul_subprocess_arguments(
+        self,
+        executor,
+        temp_workspace,
+        field,
+        expected,
+    ):
+        kwargs = {'pattern': '*.py', 'path': temp_workspace}
+        kwargs[field] = f'{kwargs[field]}\x00suffix'
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run'
+        ) as run_rg:
+            obs = run(executor.glob(GlobAction(**kwargs)))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == expected
+        run_rg.assert_not_called()
+
+    def test_missing_rg_fallback_reports_enumeration_cap(
+        self, executor, temp_workspace
+    ):
+        from openhands.runtime import action_execution_server
+
+        create_test_file(temp_workspace, 'first.txt', '')
+        create_test_file(temp_workspace, 'second.txt', '')
+
+        with (
+            patch.object(
+                action_execution_server.subprocess,
+                'run',
+                side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+            ),
+            patch.object(
+                action_execution_server,
+                '_NATIVE_SEARCH_MAX_ENTRIES',
+                1,
+            ),
+        ):
+            obs = run(executor.glob(GlobAction(pattern='*.py', path=temp_workspace)))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'glob fallback failed: search enumerated more than 1 filesystem entries'
+        )
 
 
 # ==============================================================================
@@ -717,6 +997,8 @@ class TestGrepHandler:
         first = os.path.join(temp_workspace, 'first.py')
         third = os.path.join(temp_workspace, 'nested', 'third.py')
         assert isinstance(obs, CmdOutputObservation)
+        assert obs.success is True
+        assert obs.exit_code == 0
         assert obs.content == (
             'Found 3 matches\n'
             f'{first}:\n'
@@ -725,6 +1007,221 @@ class TestGrepHandler:
             f'{third}:\n'
             '  Line 1: def third():'
         )
+
+    def test_grep_decodes_bytes_json_and_skips_unsafe_payloads(
+        self, executor, temp_workspace
+    ):
+        records = [
+            {
+                'type': 'match',
+                'data': {
+                    'path': {
+                        'bytes': base64.b64encode(b'invalid-\xff.py').decode('ascii')
+                    },
+                    'line_number': 7,
+                    'lines': {
+                        'bytes': base64.b64encode(b'needle \xff\n').decode('ascii')
+                    },
+                },
+            },
+            {
+                'type': 'match',
+                'data': {
+                    'path': {'bytes': 'not-valid-base64!'},
+                    'line_number': 8,
+                    'lines': {'text': 'must be skipped'},
+                },
+            },
+            {
+                'type': 'match',
+                'data': {
+                    'path': {'text': 'unsafe\x00.py'},
+                    'line_number': 9,
+                    'lines': {'text': 'must be skipped'},
+                },
+            },
+            [],
+        ]
+        rg_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b'\n'.join(json.dumps(record).encode('utf-8') for record in records),
+            stderr=b'',
+        )
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            return_value=rg_result,
+        ):
+            obs = run(executor.grep(GrepAction(pattern='needle', path=temp_workspace)))
+
+        expected_path = os.path.join(temp_workspace, 'invalid-�.py')
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content == (
+            f'Found 1 matches\n{expected_path}:\n  Line 7: needle �\n'
+        )
+        assert obs.success is True
+        assert obs.exit_code == 0
+
+    def test_missing_rg_grep_matches_real_rg_nested_ignore_rules(
+        self, executor, temp_workspace
+    ):
+        import shutil
+
+        if shutil.which('rg') is None:
+            pytest.skip('ripgrep is required for the parity half of this test')
+
+        expected = {
+            create_test_file(temp_workspace, 'visible.txt', 'needle\n'),
+            create_test_file(temp_workspace, 'nested/keep.py', 'needle\n'),
+            create_test_file(
+                temp_workspace,
+                'nested/deep/anchored.txt',
+                'needle\n',
+            ),
+        }
+        create_test_file(
+            temp_workspace,
+            'nested/.gitignore',
+            '/anchored.txt\nignored/\n*.py\n!keep.py\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/.ignore',
+            'ignored-by-ignore.txt\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/.rgignore',
+            'ignored-by-rgignore.txt\n',
+        )
+        create_test_file(temp_workspace, 'nested/anchored.txt', 'needle\n')
+        create_test_file(temp_workspace, 'nested/drop.py', 'needle\n')
+        create_test_file(
+            temp_workspace,
+            'nested/ignored/secret.txt',
+            'needle\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/ignored-by-ignore.txt',
+            'needle\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/ignored-by-rgignore.txt',
+            'needle\n',
+        )
+
+        action = GrepAction(pattern='needle', path=temp_workspace)
+        primary = run(executor.grep(action))
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            fallback = run(executor.grep(action))
+
+        def result_paths(observation):
+            return {
+                line[:-1]
+                for line in observation.content.splitlines()
+                if line.startswith(temp_workspace) and line.endswith(':')
+            }
+
+        assert isinstance(primary, CmdOutputObservation)
+        assert isinstance(fallback, CmdOutputObservation)
+        assert result_paths(primary) == expected
+        assert result_paths(fallback) == expected
+        assert primary.success is True
+        assert fallback.success is True
+        assert primary.exit_code == fallback.exit_code == 0
+
+    @pytest.mark.parametrize(
+        ('include', 'expected_names'),
+        [
+            ('*.txt', {'keep.txt', 'ignored.txt'}),
+            (
+                '*',
+                {'keep.txt', 'ignored.txt', 'ignored-dir/nested.txt'},
+            ),
+        ],
+    )
+    def test_missing_rg_grep_matches_real_rg_positive_glob_ignore_override(
+        self,
+        executor,
+        temp_workspace,
+        include,
+        expected_names,
+    ):
+        import shutil
+
+        if shutil.which('rg') is None:
+            pytest.skip('ripgrep is required for the parity half of this test')
+
+        create_test_file(
+            temp_workspace,
+            '.gitignore',
+            'ignored.txt\nignored-dir/\n',
+        )
+        for name in ('keep.txt', 'ignored.txt', 'ignored-dir/nested.txt'):
+            create_test_file(temp_workspace, name, 'needle\n')
+
+        action = GrepAction(
+            pattern='needle',
+            include=include,
+            path=temp_workspace,
+        )
+        primary = run(executor.grep(action))
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            fallback = run(executor.grep(action))
+
+        def result_paths(observation):
+            return {
+                line[:-1]
+                for line in observation.content.splitlines()
+                if line.startswith(temp_workspace) and line.endswith(':')
+            }
+
+        expected = {os.path.join(temp_workspace, name) for name in expected_names}
+        assert isinstance(primary, CmdOutputObservation)
+        assert isinstance(fallback, CmdOutputObservation)
+        assert result_paths(primary) == expected
+        assert result_paths(fallback) == expected
+        assert primary.exit_code == fallback.exit_code == 0
+
+    @pytest.mark.parametrize(
+        ('field', 'expected'),
+        [
+            ('pattern', 'pattern must not contain NUL bytes'),
+            ('include', 'include must not contain NUL bytes'),
+            ('path', 'path must not contain NUL bytes'),
+        ],
+    )
+    def test_grep_rejects_nul_subprocess_arguments(
+        self,
+        executor,
+        temp_workspace,
+        field,
+        expected,
+    ):
+        kwargs = {'pattern': 'needle', 'path': temp_workspace}
+        if field == 'pattern':
+            kwargs['pattern'] = 'needle\x00suffix'
+        elif field == 'include':
+            kwargs['include'] = '*.py\x00suffix'
+        else:
+            kwargs['path'] = f'{temp_workspace}\x00suffix'
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run'
+        ) as run_rg:
+            obs = run(executor.grep(GrepAction(**kwargs)))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == expected
+        run_rg.assert_not_called()
 
     def test_grep_with_line_numbers(self, executor, temp_workspace):
         """Test grep output includes line numbers."""
@@ -873,6 +1370,252 @@ class TestGrepHandler:
         assert 'foo' in obs.content
         assert 'bar' in obs.content
 
+    def test_missing_rg_fallback_handles_globs_hidden_binary_and_unreadable(
+        self, executor, temp_workspace
+    ):
+        from pathlib import Path
+
+        expected = create_test_file(temp_workspace, 'src/good.py', 'needle\n')
+        hidden = create_test_file(
+            temp_workspace,
+            '.hidden/good.pyi',
+            'needle hidden\n',
+        )
+        create_test_file(temp_workspace, '.gitignore', 'node_modules/\n')
+        create_test_file(temp_workspace, '.ignore', 'ignored*.py\n')
+        create_test_file(temp_workspace, '.rgignore', 'generated/\n')
+        create_test_file(temp_workspace, '.git/secret.py', 'needle git\n')
+        create_test_file(
+            temp_workspace,
+            'nested/node_modules/pkg/dependency.py',
+            'needle dependency\n',
+        )
+        ignored = create_test_file(
+            temp_workspace,
+            'nested/ignored-output.py',
+            'needle ignored\n',
+        )
+        create_test_file(
+            temp_workspace,
+            'nested/generated/output.py',
+            'needle generated\n',
+        )
+        create_test_file(temp_workspace, 'src/excluded.txt', 'needle text\n')
+        unreadable = create_test_file(
+            temp_workspace,
+            'src/unreadable.py',
+            'needle unreadable\n',
+        )
+        binary = os.path.join(temp_workspace, 'src', 'binary.py')
+        with open(binary, 'wb') as target:
+            target.write(b'needle before nul\nthen\x00binary\n')
+
+        original_open = Path.open
+
+        def selective_open(path, *args, **kwargs):
+            if str(path) == unreadable:
+                raise PermissionError(13, os.strerror(13), unreadable)
+            return original_open(path, *args, **kwargs)
+
+        with (
+            patch(
+                'openhands.runtime.action_execution_server.subprocess.run',
+                side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+            ),
+            patch(
+                'openhands.runtime.action_execution_server.Path.open',
+                autospec=True,
+                side_effect=selective_open,
+            ),
+        ):
+            obs = run(
+                executor.grep(
+                    GrepAction(
+                        pattern='needle',
+                        path=temp_workspace,
+                        include='**/*.{py,pyi}',
+                    )
+                )
+            )
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert expected in obs.content
+        assert hidden in obs.content
+        assert 'binary.py' not in obs.content
+        assert 'unreadable.py' not in obs.content
+        assert '.git' not in obs.content
+        assert 'node_modules' not in obs.content
+        # The positive include explicitly selects this file, overriding the
+        # matching .ignore rule just as rg does.
+        assert ignored in obs.content
+        assert 'generated' not in obs.content
+        assert 'excluded.txt' not in obs.content
+        assert obs.success is True
+        assert obs.exit_code == 0
+
+    def test_missing_rg_explicit_file_bypasses_root_ignore_rules(
+        self, executor, temp_workspace
+    ):
+        create_test_file(temp_workspace, '.gitignore', 'ignored.py\n')
+        expected = create_test_file(
+            temp_workspace,
+            'ignored.py',
+            'needle\n',
+        )
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            obs = run(executor.grep(GrepAction(pattern='needle', path=expected)))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert expected in obs.content
+        assert obs.success is True
+        assert obs.exit_code == 0
+
+    def test_missing_rg_fallback_catastrophic_regex_times_out(
+        self, executor, temp_workspace
+    ):
+        import time
+
+        from openhands.runtime import action_execution_server
+
+        create_test_file(
+            temp_workspace,
+            'catastrophic.txt',
+            ('a' * 100_000) + '!\n',
+        )
+        started_at = time.monotonic()
+
+        with (
+            patch.object(
+                action_execution_server.subprocess,
+                'run',
+                side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+            ),
+            patch.object(
+                action_execution_server,
+                '_NATIVE_SEARCH_TIMEOUT_SECONDS',
+                0.005,
+            ),
+        ):
+            obs = run(
+                executor.grep(
+                    GrepAction(
+                        pattern=r'(a+)+$',
+                        path=temp_workspace,
+                    )
+                )
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == 'grep fallback timed out after 30 seconds'
+        assert time.monotonic() - started_at < 1
+
+    def test_missing_rg_fallback_invalid_regex_is_controlled(
+        self, executor, temp_workspace
+    ):
+        create_test_file(temp_workspace, 'source.py', 'content')
+
+        with patch(
+            'openhands.runtime.action_execution_server.subprocess.run',
+            side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+        ):
+            obs = run(
+                executor.grep(GrepAction(pattern='unclosed(', path=temp_workspace))
+            )
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content.startswith(
+            'grep fallback failed: invalid regular expression:'
+        )
+
+    def test_missing_rg_fallback_reports_enumeration_cap(
+        self, executor, temp_workspace
+    ):
+        from openhands.runtime import action_execution_server
+
+        create_test_file(temp_workspace, 'first.txt', 'other')
+        create_test_file(temp_workspace, 'second.txt', 'other')
+
+        with (
+            patch.object(
+                action_execution_server.subprocess,
+                'run',
+                side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+            ),
+            patch.object(
+                action_execution_server,
+                '_NATIVE_SEARCH_MAX_ENTRIES',
+                1,
+            ),
+        ):
+            obs = run(executor.grep(GrepAction(pattern='needle', path=temp_workspace)))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'grep fallback failed: search enumerated more than 1 filesystem entries'
+        )
+
+    def test_missing_rg_fallback_rejects_oversized_newline_free_line(
+        self, executor, temp_workspace
+    ):
+        from openhands.runtime import action_execution_server
+
+        source = os.path.join(temp_workspace, 'huge.txt')
+        with open(source, 'wb') as target:
+            target.write(b'x' * 17)
+
+        with (
+            patch.object(
+                action_execution_server.subprocess,
+                'run',
+                side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+            ),
+            patch.object(
+                action_execution_server,
+                '_NATIVE_SEARCH_MAX_LINE_BYTES',
+                16,
+            ),
+        ):
+            obs = run(executor.grep(GrepAction(pattern='x', path=temp_workspace)))
+
+        assert isinstance(obs, ErrorObservation)
+        assert obs.content == (
+            'grep fallback failed: file contains a line exceeding '
+            'the 16-byte fallback limit'
+        )
+
+    def test_missing_rg_fallback_stops_reading_at_match_cap(
+        self, executor, temp_workspace
+    ):
+        from openhands.runtime import action_execution_server
+
+        source = os.path.join(temp_workspace, 'many.txt')
+        with open(source, 'wb') as target:
+            target.write((b'needle\n' * 100) + (b'x' * 33))
+
+        with (
+            patch.object(
+                action_execution_server.subprocess,
+                'run',
+                side_effect=FileNotFoundError(2, os.strerror(2), 'rg'),
+            ),
+            patch.object(
+                action_execution_server,
+                '_NATIVE_SEARCH_MAX_LINE_BYTES',
+                32,
+            ),
+        ):
+            obs = run(executor.grep(GrepAction(pattern='needle', path=temp_workspace)))
+
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.content.startswith('Found 100 matches (more matches available)')
+        assert 'Results truncated.' in obs.content
+        assert obs.success is True
+        assert obs.exit_code == 0
+
 
 # ==============================================================================
 # ListDir Handler Tests
@@ -892,6 +1635,8 @@ class TestListDirHandler:
         action = ListDirAction(path=temp_workspace)
         obs = run(executor.list_dir(action))
         assert isinstance(obs, CmdOutputObservation)
+        assert obs.success is True
+        assert obs.exit_code == 0
         assert obs.content == (
             f'<path>{temp_workspace}</path>\n'
             '<type>directory</type>\n'

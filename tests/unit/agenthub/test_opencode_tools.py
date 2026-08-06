@@ -15,6 +15,7 @@ from litellm import ModelResponse
 
 from openhands.agenthub.opencode_agent.function_calling import response_to_actions
 from openhands.agenthub.opencode_agent.opencode_agent import OpenCodeAgent
+from openhands.agenthub.opencode_agent.tools.bash import create_cmd_run_tool
 from openhands.agenthub.opencode_agent.tools.edit import EditTool
 from openhands.agenthub.opencode_agent.tools.glob import GlobTool
 from openhands.agenthub.opencode_agent.tools.grep import GrepTool
@@ -210,6 +211,18 @@ class TestToolDefinitions:
         tool_names = [tool['function']['name'] for tool in agent._get_tools()]
 
         assert FINISH_TOOL_NAME not in tool_names
+
+    @pytest.mark.parametrize('use_short_description', [False, True])
+    def test_bash_guidance_preserves_validation_pipeline_exit_status(
+        self, use_short_description
+    ):
+        description = create_cmd_run_tool(
+            use_short_description=use_short_description
+        )['function']['description']
+
+        assert 'set -o pipefail' in description
+        assert 'pytest -q 2>&1 | tail -n 50' in description
+        assert 'test, lint, typecheck, or build' in description
 
 
 # ==============================================================================

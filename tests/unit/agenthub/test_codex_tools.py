@@ -173,6 +173,13 @@ class TestToolDefinitions:
         assert params['required'] == ['command']
         assert params['additionalProperties'] is False
 
+    def test_shell_command_tool_warns_against_masked_pipeline_failures(self):
+        description = ShellCommandTool['function']['description']
+
+        assert 'set -o pipefail' in description
+        assert 'test, lint, build, or typecheck' in description
+        assert '`tail`, `head`, `grep`' in description
+
     def test_read_file_tool_schema(self):
         """Test ReadFileTool has correct schema structure."""
         assert ReadFileTool['type'] == 'function'
@@ -277,6 +284,8 @@ class TestShellCommandFunctionCalling:
         assert len(actions) == 1
         assert isinstance(actions[0], CmdRunAction)
         assert actions[0].command == 'ls -la'
+        assert actions[0].cwd is None
+        assert actions[0].login is None
 
     def test_shell_command_with_timeout(self):
         """Test shell_command converts timeout_ms to seconds."""
@@ -287,16 +296,111 @@ class TestShellCommandFunctionCalling:
         assert len(actions) == 1
         assert isinstance(actions[0], CmdRunAction)
         assert actions[0].command == 'sleep 5'
+        assert actions[0].timeout == 10
+        assert actions[0].blocking is True
 
-    def test_shell_command_timeout_capped_at_600(self):
+    @pytest.mark.parametrize('timeout_ms', [999999999, 10**400])
+    def test_shell_command_timeout_capped_at_600(self, timeout_ms):
         """Test shell_command timeout is capped at 600 seconds."""
         response = create_mock_response(
             CODEX_SHELL_COMMAND_TOOL_NAME,
-            {'command': 'long_cmd', 'timeout_ms': 999999999},
+            {'command': 'long_cmd', 'timeout_ms': timeout_ms},
         )
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], CmdRunAction)
+        assert actions[0].timeout == 600
+
+    @pytest.mark.parametrize('login', [True, False])
+    def test_shell_command_preserves_workdir_and_login(self, login):
+        response = create_mock_response(
+            CODEX_SHELL_COMMAND_TOOL_NAME,
+            {
+                'command': 'pwd',
+                'workdir': '/workspace/path with spaces',
+                'login': login,
+            },
+        )
+
+        [action] = response_to_actions(response)
+
+        assert isinstance(action, CmdRunAction)
+        assert action.cwd == '/workspace/path with spaces'
+        assert action.login is login
+
+    @pytest.mark.parametrize(
+        'timeout_ms',
+        [
+            None,
+            True,
+            '1000',
+            0,
+            -1,
+            float('nan'),
+            float('inf'),
+            5e-324,
+        ],
+        ids=[
+            'null',
+            'bool',
+            'string',
+            'zero',
+            'negative',
+            'nan',
+            'infinity',
+            'underflowing-float',
+        ],
+    )
+    def test_shell_command_rejects_invalid_timeout(self, timeout_ms):
+        response = create_mock_response(
+            CODEX_SHELL_COMMAND_TOOL_NAME,
+            {'command': 'sleep 5', 'timeout_ms': timeout_ms},
+        )
+
+        [action] = response_to_actions(response)
+
+        assert isinstance(action, ValidationFailureAction)
+        assert "Invalid value passed to 'timeout_ms'" in action.error_message
+
+    @pytest.mark.parametrize(
+        'arguments',
+        [
+            {'command': None},
+            {'command': 'printf before\0after'},
+            {'command': 'pwd', 'workdir': ''},
+            {'command': 'pwd', 'workdir': '/tmp/before\0after'},
+            {'command': 'pwd', 'workdir': 'relative/path'},
+            {'command': 'pwd', 'workdir': 3},
+            {'command': 'pwd', 'login': 'true'},
+            {'command': 'pwd', 'is_input': True},
+            {'command': 'pwd', 'is_input': []},
+            {'command': 'pwd', 'is_input': {}},
+            {'command': 'pwd', 'is_input': 'yes'},
+            {'command': 'input', 'is_input': 'true', 'workdir': '/workspace'},
+            {'command': 'input', 'is_input': 'true', 'login': False},
+        ],
+        ids=[
+            'command-type',
+            'command-nul',
+            'empty-workdir',
+            'workdir-nul',
+            'relative-workdir',
+            'workdir-type',
+            'login-type',
+            'input-type',
+            'input-list',
+            'input-object',
+            'input-enum',
+            'input-workdir',
+            'input-login',
+        ],
+    )
+    def test_shell_command_rejects_invalid_arguments(self, arguments):
+        response = create_mock_response(CODEX_SHELL_COMMAND_TOOL_NAME, arguments)
+
+        [action] = response_to_actions(response)
+
+        assert isinstance(action, ValidationFailureAction)
 
     def test_shell_command_missing_command(self):
         """Test shell_command returns validation failure when command missing."""
@@ -640,6 +744,15 @@ class TestEdgeCases:
         actions = response_to_actions(response)
         assert len(actions) == 1
         assert isinstance(actions[0], ValidationFailureAction)
+
+    @pytest.mark.parametrize('arguments', [None, [], 'command'])
+    def test_non_object_json_arguments(self, arguments):
+        response = create_mock_response(CODEX_SHELL_COMMAND_TOOL_NAME, arguments)
+
+        [action] = response_to_actions(response)
+
+        assert isinstance(action, ValidationFailureAction)
+        assert action.error_message == 'Tool call arguments must be a JSON object'
 
     def test_content_only_response(self):
         """Test that a response with no tool calls terminates the loop."""

@@ -3,7 +3,8 @@ from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChun
 from openhands.llm.tool_names import CODEX_SHELL_COMMAND_TOOL_NAME
 
 _SHELL_COMMAND_DESCRIPTION = f"""Runs a shell command and returns its output.
-- Always set the `workdir` param when using the {CODEX_SHELL_COMMAND_TOOL_NAME} function. Do not use `cd` unless absolutely necessary."""
+- Always set the `workdir` param when using the {CODEX_SHELL_COMMAND_TOOL_NAME} function. Do not use `cd` unless absolutely necessary.
+- When piping a test, lint, build, or typecheck command through `tail`, `head`, `grep`, or another filter, enable `set -o pipefail` so a failure in the command is not hidden by a successful filter."""
 
 ShellCommandTool = ChatCompletionToolParam(
     type='function',
@@ -24,7 +25,7 @@ ShellCommandTool = ChatCompletionToolParam(
                 },
                 'login': {
                     'type': 'boolean',
-                    'description': 'Whether to run the shell with login shell semantics. Defaults to true.',
+                    'description': 'Whether to run the command in a fresh shell with login-shell semantics. When omitted, reuse the existing shell environment.',
                 },
                 'timeout_ms': {
                     'type': 'number',
