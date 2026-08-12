@@ -44,3 +44,13 @@ def test_update_returns_false_when_parent_is_missing(tmp_path: Path) -> None:
     assert update_nemo_gym_metrics({'create_runtime_time': 1.25}, metrics_path=path) is False
     assert not path.exists()
     assert not missing_parent.exists()
+
+
+def test_run_infer_uses_safe_metrics_helper() -> None:
+    source = Path('evaluation/benchmarks/swe_bench/run_infer.py').read_text()
+
+    assert 'from evaluation.benchmarks.swe_bench.nemo_gym_metrics import' in source
+    assert 'def update_metrics(' not in source
+    assert 'update_nemo_gym_metrics({"create_runtime_time"' in source
+    assert 'update_nemo_gym_metrics({"connect_to_runtime_time"' in source
+    assert 'update_nemo_gym_metrics({"initialize_runtime_time"' in source
