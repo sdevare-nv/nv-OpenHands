@@ -37,7 +37,7 @@ def update_nemo_gym_metrics(
         os.replace(temporary, path)
         published = True
         return True
-    except (json.JSONDecodeError, OSError, TypeError) as error:
+    except (json.JSONDecodeError, OSError, TypeError, UnicodeDecodeError) as error:
         logger.warning('Could not update NeMo Gym metrics at %s: %s', path, error)
         return False
     finally:

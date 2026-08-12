@@ -37,6 +37,16 @@ def test_update_rejects_malformed_json_without_replacing_it(tmp_path: Path) -> N
     assert list(tmp_path.iterdir()) == [path]
 
 
+def test_update_rejects_invalid_utf8_without_replacing_it(tmp_path: Path) -> None:
+    path = tmp_path / 'metrics.json'
+    original = b'\xff\xfe\xfa'
+    path.write_bytes(original)
+
+    assert update_nemo_gym_metrics({'create_runtime_time': 1.25}, metrics_path=path) is False
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
 def test_update_returns_false_when_parent_is_missing(tmp_path: Path) -> None:
     missing_parent = tmp_path / 'missing'
     path = missing_parent / 'metrics.json'
