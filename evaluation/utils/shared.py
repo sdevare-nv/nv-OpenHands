@@ -844,8 +844,8 @@ def get_metrics(state: State) -> dict[str, Any]:
 def get_default_sandbox_config_for_eval() -> SandboxConfig:
     return SandboxConfig(
         use_host_network=False,
-        # large enough timeout, since some testcases take very long to run
-        timeout=300,
+        # Built directly, so load_from_env's SANDBOX_TIMEOUT handling does not apply.
+        timeout=int(os.environ.get('SANDBOX_TIMEOUT', '300')),
         api_key=os.environ.get('ALLHANDS_API_KEY', None),
         runtime_startup_env_vars={'NO_CHANGE_TIMEOUT_SECONDS': '30'},
         remote_runtime_api_url=os.environ.get('SANDBOX_REMOTE_RUNTIME_API_URL'),
