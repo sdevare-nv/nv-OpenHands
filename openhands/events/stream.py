@@ -2,7 +2,7 @@ import asyncio
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import partial
 from typing import Any, Callable
@@ -165,7 +165,7 @@ class EventStream(EventStore):
             raise ValueError(
                 f'Event already has an ID:{event.id}. It was probably added back to the EventStream from inside a handler, triggering a loop.'
             )
-        event._timestamp = datetime.now().isoformat()
+        event._timestamp = datetime.now(timezone.utc).isoformat()
         event._source = source  # type: ignore [attr-defined]
         with self._lock:
             event._id = self.cur_id  # type: ignore [attr-defined]
