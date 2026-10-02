@@ -148,6 +148,10 @@ class NemoGymClient:
         from openhands.llm.llm import ModelResponse
 
         message_dicts = [m.model_dump() for m in messages]
+        for message in message_dicts:
+            if message.get("role") == "tool":
+                # Gym identifies tool results by tool_call_id, not name.
+                message.pop("name", None)
 
         params: dict = {
             "messages": message_dicts,
