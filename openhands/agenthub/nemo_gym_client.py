@@ -5,10 +5,13 @@ LLM completions through the NeMo Gym infrastructure instead of calling
 litellm directly.
 """
 
+import hashlib
 import json
 import os
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -24,8 +27,70 @@ if TYPE_CHECKING:
     from openhands.llm.llm import LLM, ModelResponse
 
 
+NEMO_GYM_SAMPLING_SEED_PROTOCOL_VERSION = 1
+
+
+class SamplingSession:
+    """Opt-in episode sampling; only whole-episode retries are supported."""
+
+    def __init__(self, episode_seed: int) -> None:
+        self.episode_seed = episode_seed
+        self.next_call = 0
+        self.busy = False
+
+    @classmethod
+    def from_environment(cls) -> "SamplingSession | None":
+        seed = os.environ.get("NEMO_GYM_SAMPLING_SEED")
+        if seed is None:
+            return None
+        if not seed.isascii() or not seed.isdecimal() or int(seed) >= 2**63:
+            raise ValueError(
+                "NEMO_GYM_SAMPLING_SEED must be a nonnegative signed 64-bit integer"
+            )
+        if os.environ.get("REPLAY_MESSAGES_PATH"):
+            raise ValueError(
+                "Seeded NeMo Gym sampling supports whole-episode replay only"
+            )
+        return cls(int(seed))
+
+    @contextmanager
+    def call(self, messages: list["Message"]) -> Iterator[int]:
+        if self.busy:
+            raise RuntimeError("Concurrent seeded NeMo Gym model calls are unsupported")
+        if self.next_call == 0:
+            roles = [message.model_dump().get("role") for message in messages]
+            if any(role in ("assistant", "tool", "function") for role in roles):
+                raise ValueError(
+                    "Seeded NeMo Gym sampling requires a fresh episode without assistant/tool history"
+                )
+        self.busy = True
+        try:
+            # v1 is fully specified by these ASCII bytes, SHA256, big endian and mask.
+            payload = (
+                f"nemo-gym/model-call/v1:{self.episode_seed}:{self.next_call}".encode(
+                    "ascii"
+                )
+            )
+            seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
+                (1 << 63) - 1
+            )
+            yield seed
+        except BaseException:
+            # Retrying an uncommitted logical call must reuse its seed.
+            raise
+        else:
+            self.next_call += 1
+        finally:
+            self.busy = False
+
+
 class NemoGymClient:
     """Client that proxies LLM completions through the NeMo Gym server.
+
+    Set ``NEMO_GYM_SAMPLING_SEED`` to a nonnegative signed 64-bit episode seed
+    to send a distinct reproducible seed with each sequential model call. Failed
+    calls retain their seed for retry. Start from a fresh episode; the call ordinal
+    is not restored from recorded messages. The model server must support seeds.
 
     Usage::
 
@@ -43,6 +108,7 @@ class NemoGymClient:
         )
         self.model_server_cookies = None
         self.llm = llm
+        self._sampling = SamplingSession.from_environment()
 
     async def model_call(
         self,
@@ -59,9 +125,14 @@ class NemoGymClient:
             A validated ModelResponse from the server.
         """
         start_time = time.time()
-        response = await self._post_completion(messages, tools)
-        self._update_model_call_time(start_time)
-        return response
+        if self._sampling is None:
+            response = await self._post_completion(messages, tools)
+            self._update_model_call_time(start_time)
+            return response
+        with self._sampling.call(messages) as seed:
+            response = await self._post_completion(messages, tools, sampling_seed=seed)
+            self._update_model_call_time(start_time)
+            return response
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -71,6 +142,8 @@ class NemoGymClient:
         self,
         messages: list["Message"],
         tools: "list[ChatCompletionToolParam] | None" = None,
+        *,
+        sampling_seed: int | None = None,
     ) -> "ModelResponse":
         from openhands.llm.llm import ModelResponse
 
@@ -80,6 +153,8 @@ class NemoGymClient:
             "messages": message_dicts,
             **self.llm._nemo_gym_llm_kwargs,
         }
+        if sampling_seed is not None:
+            params["seed"] = sampling_seed
         if tools:
             params["tools"] = tools
 
