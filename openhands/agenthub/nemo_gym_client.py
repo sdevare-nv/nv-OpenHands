@@ -153,6 +153,9 @@ class NemoGymClient:
             "messages": message_dicts,
             **self.llm._nemo_gym_llm_kwargs,
         }
+        # These configure LiteLLM's AWS transport, not the Gym model request.
+        for key in ("aws_region_name", "aws_access_key_id", "aws_secret_access_key"):
+            params.pop(key, None)
         if sampling_seed is not None:
             params["seed"] = sampling_seed
         if tools:
