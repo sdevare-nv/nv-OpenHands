@@ -24,6 +24,38 @@ if TYPE_CHECKING:
     from openhands.llm.llm import LLM, ModelResponse
 
 
+# The NeMo Gym model server validates /v1/chat/completions against the OpenAI chat
+# schema and rejects unknown fields with 422 (NeMo Gym 65129dd4, "pin openai to
+# 2.44.0"). LiteLLM-only kwargs (AWS Bedrock routing and credentials) never apply to
+# that server and must not reach it.
+_LITELLM_ONLY_KWARGS = frozenset(
+    {"aws_region_name", "aws_access_key_id", "aws_secret_access_key"}
+)
+
+
+def gym_chat_params(
+    message_dicts: list[dict],
+    llm_kwargs: dict,
+    tools: "list[ChatCompletionToolParam] | None" = None,
+) -> dict:
+    """Build the NeMo Gym /v1/chat/completions body from OpenHands state.
+
+    Only OpenAI chat fields are sent: unset (None) and LiteLLM-only kwargs are
+    omitted, and the tool name OpenHands adds to tool messages is dropped (OpenAI
+    tool messages have no `name`).
+    """
+    for message in message_dicts:
+        if message.get("role") == "tool":
+            message.pop("name", None)
+    params: dict = {"messages": message_dicts}
+    for key, value in llm_kwargs.items():
+        if value is not None and key not in _LITELLM_ONLY_KWARGS:
+            params[key] = value
+    if tools:
+        params["tools"] = tools
+    return params
+
+
 class NemoGymClient:
     """Client that proxies LLM completions through the NeMo Gym server.
 
@@ -76,12 +108,7 @@ class NemoGymClient:
 
         message_dicts = [m.model_dump() for m in messages]
 
-        params: dict = {
-            "messages": message_dicts,
-            **self.llm._nemo_gym_llm_kwargs,
-        }
-        if tools:
-            params["tools"] = tools
+        params = gym_chat_params(message_dicts, self.llm._nemo_gym_llm_kwargs, tools)
 
         fields_to_remove = [
             "prompt_token_ids",
